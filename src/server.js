@@ -4,117 +4,97 @@ import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import { z } from 'zod';
 
-// Configuración
 dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middlewares
-app.use(cors()); // Permite peticiones desde el Frontend (localhost:5173)
+app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// Conexión a Supabase
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_SERVICE_KEY; // ¡Usar la SERVICE_ROLE key, no la anon!
+const supabase = createClient(
+  process.env.SUPABASE_URL || '', 
+  process.env.SUPABASE_SERVICE_KEY || '', 
+  { auth: { autoRefreshToken: false, persistSession: false } }
+);
 
-if (!supabaseUrl || !supabaseKey) {
-  console.error('❌ Error: Faltan variables de entorno de Supabase');
-  process.exit(1);
-}
+// Token de Calendly (simulado) - En producción esto iría en .env
+const CALENDLY_TOKEN = process.env.CALENDLY_TOKEN || "token_simulado";
 
-const supabase = createClient(supabaseUrl, supabaseKey);
+app.get('/', (req, res) => res.json({ status: 'online' }));
 
-// Esquema de Validación (Zod)
-const trialSchema = z.object({
-  fullName: z.string().min(3, "El nombre es muy corto"),
-  email: z.string().email("Email inválido"),
-  phone: z.string().min(8, "Teléfono inválido"),
-});
+// --- 1. AGENDAR REUNIÓN (/api/schedule) ---
+app.post('/api/schedule', async (req, res) => {
+  const { firstName, lastName, email, phone, date, time } = req.body;
+  console.log(`📅 Nueva reunión: ${email} - ${date} ${time}`);
 
-// --- ENDPOINTS ---
-
-// Health Check
-app.get('/health', (req, res) => {
-  res.json({ status: 'online', system: 'VINTEX AI API v1.0' });
-});
-
-// POST: Iniciar Prueba Gratuita
-app.post('/api/start-trial', async (req, res) => {
   try {
-    // 1. Validar datos entrantes
-    const data = trialSchema.parse(req.body);
-    console.log(`⚡ Nueva solicitud de trial: ${data.email}`);
-
-    // 2. Verificar si el usuario ya existe
-    const { data: existingUser } = await supabase
-      .from('users')
-      .select('id')
-      .eq('email', data.email)
-      .single();
-
-    if (existingUser) {
-      return res.status(409).json({ error: 'Este email ya tiene una cuenta registrada.' });
-    }
-
-    // 3. Crear Usuario en DB
-    const { data: newUser, error: userError } = await supabase
-      .from('users')
-      .insert({
-        full_name: data.fullName,
-        email: data.email,
-        phone: data.phone,
-        role: 'user'
-      })
-      .select()
-      .single();
-
-    if (userError) throw userError;
-
-    // 4. Crear Registro de Trial (15 días)
-    const startDate = new Date();
-    const endDate = new Date();
-    endDate.setDate(startDate.getDate() + 15);
-
-    const { error: trialError } = await supabase
-      .from('trials')
-      .insert({
-        user_id: newUser.id,
-        start_date: startDate,
-        end_date: endDate,
-        status: 'active'
-      });
-
-    if (trialError) throw trialError;
-
-    // 5. (FASE 4) Disparar Webhook de Automatización (n8n)
-    // Aquí iría el fetch() al webhook de n8n para enviar el email de bienvenida
-    // await fetch(process.env.N8N_WEBHOOK_URL, { method: 'POST', body: JSON.stringify(newUser) });
-
-    console.log(`✅ Trial creado exitosamente para: ${newUser.id}`);
+    // Aquí podrías guardar el lead en una tabla 'leads' o 'meetings' en Supabase
+    // O integrarte con la API real de Calendly usando el token.
     
-    return res.status(201).json({ 
+    // Simulación de éxito
+    return res.status(200).json({ 
       success: true, 
-      message: 'Prueba iniciada correctamente. Revisa tu correo.',
-      trialEnd: endDate
+      message: 'Reunión pre-agendada.' 
     });
 
   } catch (error) {
-    console.error('❌ Error en /api/start-trial:', error);
-    
-    if (error instanceof z.ZodError) {
-      return res.status(400).json({ error: 'Datos inválidos', details: error.errors });
-    }
-
-    return res.status(500).json({ error: 'Error interno del servidor' });
+    console.error('Error scheduling:', error);
+    return res.status(500).json({ error: 'Error al agendar' });
   }
 });
 
-// Iniciar Servidor
+// --- 2. REGISTRO DE CUENTA (/api/register) ---
+// Este endpoint crea la cuenta real en Supabase Auth
+app.post('/api/register', async (req, res) => {
+  const { email, password, fullName } = req.body; // Recibimos password real
+  console.log('📝 Creando cuenta para:', email);
+
+  try {
+    // Crear usuario en Auth
+    const { data: authUser, error: authError } = await supabase.auth.admin.createUser({
+      email,
+      password,
+      email_confirm: true,
+      user_metadata: { full_name: fullName } // Guardamos el nombre en metadata
+    });
+
+    if (authError) return res.status(400).json({ error: authError.message });
+
+    // Guardar en DB pública 'users'
+    const { error: dbError } = await supabase.from('users').insert({
+      id: authUser.user.id,
+      email,
+      full_name: fullName || 'Usuario Nuevo',
+      role: 'user'
+    });
+
+    if (dbError) console.error("Error DB:", dbError);
+
+    return res.status(201).json({ success: true, message: 'Cuenta creada.' });
+
+  } catch (error) {
+    console.error('❌ Error Registro:', error);
+    return res.status(500).json({ error: 'Error del servidor' });
+  }
+});
+
+// --- 3. LOGIN (/api/login) ---
+app.post('/api/login', async (req, res) => {
+  const { email, password } = req.body;
+  try {
+    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+    if (error) return res.status(401).json({ error: 'Credenciales inválidas' });
+
+    return res.status(200).json({
+      success: true,
+      user: { id: data.user.id, email: data.user.email },
+      session: { token: data.session.access_token }
+    });
+  } catch (err) {
+    return res.status(500).json({ error: 'Error del servidor' });
+  }
+});
+
 app.listen(PORT, () => {
-  console.log(`
-  🚀 VINTEX AI Backend
-  --------------------
-  📡 Server running on port ${PORT}
-  🔗 Endpoint: http://localhost:${PORT}/api/start-trial
-  `);
+  console.log(`🚀 SERVIDOR ACTIVO EN PUERTO ${PORT}`);
 });
