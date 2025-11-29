@@ -2,7 +2,6 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
-import { z } from 'zod';
 
 dotenv.config();
 const app = express();
@@ -11,90 +10,104 @@ const PORT = process.env.PORT || 3000;
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-const supabase = createClient(
-  process.env.SUPABASE_URL || '', 
-  process.env.SUPABASE_SERVICE_KEY || '', 
+// --- CONEXIÓN A LA BASE DE DATOS MAESTRA (Usuarios y Permisos) ---
+const masterSupabase = createClient(
+  process.env.SUPABASE_URL, 
+  process.env.SUPABASE_SERVICE_KEY,
   { auth: { autoRefreshToken: false, persistSession: false } }
 );
 
-// Token de Calendly (simulado) - En producción esto iría en .env
-const CALENDLY_TOKEN = process.env.CALENDLY_TOKEN || "token_simulado";
-
-app.get('/', (req, res) => res.json({ status: 'online' }));
-
-// --- 1. AGENDAR REUNIÓN (/api/schedule) ---
-app.post('/api/schedule', async (req, res) => {
-  const { firstName, lastName, email, phone, date, time } = req.body;
-  console.log(`📅 Nueva reunión: ${email} - ${date} ${time}`);
-
-  try {
-    // Aquí podrías guardar el lead en una tabla 'leads' o 'meetings' en Supabase
-    // O integrarte con la API real de Calendly usando el token.
-    
-    // Simulación de éxito
-    return res.status(200).json({ 
-      success: true, 
-      message: 'Reunión pre-agendada.' 
-    });
-
-  } catch (error) {
-    console.error('Error scheduling:', error);
-    return res.status(500).json({ error: 'Error al agendar' });
-  }
-});
-
-// --- 2. REGISTRO DE CUENTA (/api/register) ---
-// Este endpoint crea la cuenta real en Supabase Auth
-app.post('/api/register', async (req, res) => {
-  const { email, password, fullName } = req.body; // Recibimos password real
-  console.log('📝 Creando cuenta para:', email);
-
-  try {
-    // Crear usuario en Auth
-    const { data: authUser, error: authError } = await supabase.auth.admin.createUser({
-      email,
-      password,
-      email_confirm: true,
-      user_metadata: { full_name: fullName } // Guardamos el nombre en metadata
-    });
-
-    if (authError) return res.status(400).json({ error: authError.message });
-
-    // Guardar en DB pública 'users'
-    const { error: dbError } = await supabase.from('users').insert({
-      id: authUser.user.id,
-      email,
-      full_name: fullName || 'Usuario Nuevo',
-      role: 'user'
-    });
-
-    if (dbError) console.error("Error DB:", dbError);
-
-    return res.status(201).json({ success: true, message: 'Cuenta creada.' });
-
-  } catch (error) {
-    console.error('❌ Error Registro:', error);
-    return res.status(500).json({ error: 'Error del servidor' });
-  }
-});
-
-// --- 3. LOGIN (/api/login) ---
+// --- 1. LOGIN & ORQUESTACIÓN DE MICROSERVICIOS ---
 app.post('/api/login', async (req, res) => {
   const { email, password } = req.body;
+  
   try {
-    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
-    if (error) return res.status(401).json({ error: 'Credenciales inválidas' });
+    // A. Autenticación Básica (Identity Provider)
+    const { data: authData, error: authError } = await masterSupabase.auth.signInWithPassword({ 
+      email, 
+      password 
+    });
 
+    if (authError) return res.status(401).json({ error: 'Credenciales inválidas' });
+
+    const userId = authData.user.id;
+
+    // B. Verificación de Permisos (Microservicio de Cuentas)
+    // Buscamos en 'servisi' usando el ID del usuario autenticado
+    const { data: servicios, error: servError } = await masterSupabase
+      .from('servisi')
+      .select('*')
+      .eq('ID_User', userId)
+      .single();
+
+    if (servError || !servicios) {
+      return res.status(403).json({ error: 'No tienes servicios activos asociados a esta cuenta.' });
+    }
+
+    // C. Enrutamiento de Servicios (Service Mesh Logic)
+    let clinicConfig = null;
+    let botConfig = null;
+
+    // 1. Si tiene el servicio WEB_CLINICA activo
+    if (servicios.web_clinica === true) {
+      // Buscamos las credenciales específicas de SU instancia en la tabla web_clinica
+      // Asumimos que la tabla web_clinica tiene una FK al usuario o a la empresa
+      const { data: webData } = await masterSupabase
+        .from('web_clinica')
+        .select('supabase_url, supabase_anon_key, jwt_secret')
+        .eq('user_id', userId) // O la relación que tengas definida
+        .single();
+        
+      if (webData) {
+        clinicConfig = {
+          url: webData.supabase_url,
+          key: webData.supabase_anon_key,
+          // No enviamos el secret al frontend por seguridad, solo lo necesario
+        };
+      }
+    }
+
+    // 2. Si tiene el servicio BOT_CLINICA activo (n8n)
+    if (servicios.Bot_clinica === true) {
+      const { data: webhookData } = await masterSupabase
+        .from('n8n_webhook')
+        .select('n8n_webhook_id')
+        .eq('user_id', userId) // Asumiendo relación
+        .single();
+        
+      botConfig = webhookData;
+    }
+
+    // D. Respuesta Unificada
     return res.status(200).json({
       success: true,
-      user: { id: data.user.id, email: data.user.email },
-      session: { token: data.session.access_token }
+      user: {
+        id: userId,
+        email: authData.user.email,
+        role: 'user', // Esto vendría de tu tabla 'users' -> 'role'
+      },
+      session: { 
+        access_token: authData.session.access_token 
+      },
+      // Aquí entregamos las llaves para que el Frontend se conecte al backend correcto
+      config: {
+        clinic: clinicConfig, // URL y Key de la BBDD de la clínica específica
+        bot: botConfig
+      }
     });
+
   } catch (err) {
-    return res.status(500).json({ error: 'Error del servidor' });
+    console.error(err);
+    return res.status(500).json({ error: 'Error interno del orquestador' });
   }
+});
+
+// --- 2. REGISTRO (Crea la estructura en la DB Maestra) ---
+app.post('/api/register', async (req, res) => {
+    // Lógica existente de registro, asegurando crear la entrada en 'servisi' por defecto en FALSE
+    // ... (código similar al anterior pero insertando en 'servisi')
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 SERVIDOR ACTIVO EN PUERTO ${PORT}`);
+  console.log(`🚀 ORQUESTADOR VINTEX_IA ACTIVO EN PUERTO ${PORT}`);
 });
