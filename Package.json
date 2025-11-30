@@ -2,11 +2,11 @@
   "name": "vintex-api",
   "version": "1.0.0",
   "description": "API Server for VINTEX AI",
-  "main": "src/server.js",
+  "main": "server.js",
   "type": "module",
   "scripts": {
-    "start": "node src/server.js",
-    "dev": "node --watch src/server.js"
+    "start": "node server.js",
+    "dev": "node --watch server.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0",
