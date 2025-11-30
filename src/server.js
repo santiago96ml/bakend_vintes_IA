@@ -1,3 +1,4 @@
+// src/server.js
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
@@ -10,102 +11,124 @@ const PORT = process.env.PORT || 3000;
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// --- CONEXIÓN A LA BASE DE DATOS MAESTRA (Usuarios y Permisos) ---
+// Conexión a DB Maestra (VINTEX AI)
 const masterSupabase = createClient(
   process.env.SUPABASE_URL, 
   process.env.SUPABASE_SERVICE_KEY,
   { auth: { autoRefreshToken: false, persistSession: false } }
 );
 
-// --- 1. LOGIN & ORQUESTACIÓN DE MICROSERVICIOS ---
-app.post('/api/login', async (req, res) => {
-  const { email, password } = req.body;
-  
+// =============================================================================
+// 1. ENDPOINT: LOGIN / REGISTRO CON GOOGLE (Unificado)
+// =============================================================================
+// Este endpoint recibe el 'access_token' de Google desde el Frontend
+app.post('/api/auth/google', async (req, res) => {
+  const { googleAccessToken } = req.body; // Token que te da Google en el frontend
+
   try {
-    // A. Autenticación Básica (Identity Provider)
-    const { data: authData, error: authError } = await masterSupabase.auth.signInWithPassword({ 
-      email, 
-      password 
-    });
+    // A. Validar el token de Google con Supabase Auth
+    const { data: { user }, error: authError } = await masterSupabase.auth.getUser(googleAccessToken);
 
-    if (authError) return res.status(401).json({ error: 'Credenciales inválidas' });
+    if (authError || !user) {
+      return res.status(401).json({ error: 'Token de Google inválido o expirado.' });
+    }
 
-    const userId = authData.user.id;
+    const email = user.email;
+    const userId = user.id; // ID único generado por Supabase Auth
+    const fullName = user.user_metadata.full_name || 'Usuario Google';
 
-    // B. Verificación de Permisos (Microservicio de Cuentas)
-    // Buscamos en 'servisi' usando el ID del usuario autenticado
-    const { data: servicios, error: servError } = await masterSupabase
+    // B. Sincronizar tabla 'public.users' (Lógica de "Crear Cuenta" implícita)
+    // Usamos 'upsert' para crear si no existe, o actualizar si ya existe.
+    const { error: upsertError } = await masterSupabase
+      .from('users')
+      .upsert({
+        id: userId,
+        email: email,
+        full_name: fullName,
+        // role: 'user' (o FALSE según tu esquema) se pone por default en la DB
+        // created_at se pone solo
+      }, { onConflict: 'id' });
+
+    if (upsertError) {
+      console.error('Error upsert users:', upsertError);
+      return res.status(500).json({ error: 'Error al registrar usuario en base de datos.' });
+    }
+
+    // C. Verificar Servicios (Tabla 'servisi')
+    // Buscamos las filas 'web_clinica' y 'Bot_clinica'
+    let { data: servicios, error: servError } = await masterSupabase
       .from('servisi')
-      .select('*')
+      .select('web_clinica, Bot_clinica')
       .eq('ID_User', userId)
       .single();
 
-    if (servError || !servicios) {
-      return res.status(403).json({ error: 'No tienes servicios activos asociados a esta cuenta.' });
+    // Si no existe entrada en servisi (usuario nuevo), la creamos por defecto en FALSE
+    if (!servicios) {
+       const { data: newService } = await masterSupabase
+         .from('servisi')
+         .insert({ ID_User: userId, web_clinica: false, Bot_clinica: false })
+         .select()
+         .single();
+       servicios = newService;
     }
 
-    // C. Enrutamiento de Servicios (Service Mesh Logic)
+    // D. Lógica de Configuración Web Clínica
     let clinicConfig = null;
-    let botConfig = null;
 
-    // 1. Si tiene el servicio WEB_CLINICA activo
-    if (servicios.web_clinica === true) {
-      // Buscamos las credenciales específicas de SU instancia en la tabla web_clinica
-      // Asumimos que la tabla web_clinica tiene una FK al usuario o a la empresa
-      const { data: webData } = await masterSupabase
+    // Si web_clinica es TRUE
+    if (servicios && servicios.web_clinica === true) {
+      
+      // Buscamos en la tabla 'web_clinica' usando el ID del usuario
+      const { data: webData, error: webError } = await masterSupabase
         .from('web_clinica')
-        .select('supabase_url, supabase_anon_key, jwt_secret')
-        .eq('user_id', userId) // O la relación que tengas definida
+        .select('SUPABASE_URL, SUPABASE_SERVICE_KEY') // Lo que pediste
+        .eq('ID_USER', userId)
         .single();
-        
+
       if (webData) {
+        // Preparamos el objeto para mandar al Backend de la Clínica
         clinicConfig = {
-          url: webData.supabase_url,
-          key: webData.supabase_anon_key,
-          // No enviamos el secret al frontend por seguridad, solo lo necesario
+            // Mapeo específico solicitado en tu prompt:
+            MASTER_SUPABASE_URL: webData.SUPABASE_URL, 
+            MASTER_SUPABASE_SERVICE_KEY: webData.SUPABASE_SERVICE_KEY,
+            CLINIC_USER_ID: userId // "ID_USER" a "CLINIC_USER_ID"
         };
       }
     }
 
-    // 2. Si tiene el servicio BOT_CLINICA activo (n8n)
-    if (servicios.Bot_clinica === true) {
-      const { data: webhookData } = await masterSupabase
-        .from('n8n_webhook')
-        .select('n8n_webhook_id')
-        .eq('user_id', userId) // Asumiendo relación
-        .single();
-        
-      botConfig = webhookData;
-    }
-
-    // D. Respuesta Unificada
+    // E. Respuesta Final al Frontend
+    // El frontend recibirá esto y decidirá si redirigir al Dashboard o mostrar "Sin Servicios"
     return res.status(200).json({
       success: true,
-      user: {
-        id: userId,
-        email: authData.user.email,
-        role: 'user', // Esto vendría de tu tabla 'users' -> 'role'
+      session: {
+        access_token: googleAccessToken, // O un nuevo JWT propio si prefieres
+        user: {
+            id: userId,
+            email: email,
+            role_admin: false // O lo que leas de la DB
+        }
       },
-      session: { 
-        access_token: authData.session.access_token 
+      servicios: {
+          web_clinica: servicios.web_clinica,
+          bot_clinica: servicios.Bot_clinica
       },
-      // Aquí entregamos las llaves para que el Frontend se conecte al backend correcto
-      config: {
-        clinic: clinicConfig, // URL y Key de la BBDD de la clínica específica
-        bot: botConfig
-      }
+      // Esta configuración NO se debe guardar en LocalStorage del navegador por seguridad
+      // Se debe enviar al backend satélite en el paso de "boot-config"
+      satelliteConfig: clinicConfig 
     });
 
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ error: 'Error interno del orquestador' });
+    return res.status(500).json({ error: 'Error interno del servidor.' });
   }
 });
 
-// --- 2. REGISTRO (Crea la estructura en la DB Maestra) ---
-app.post('/api/register', async (req, res) => {
-    // Lógica existente de registro, asegurando crear la entrada en 'servisi' por defecto en FALSE
-    // ... (código similar al anterior pero insertando en 'servisi')
+// Endpoint auxiliar para que el Servidor Satélite pida sus credenciales (como vimos antes)
+// Esto es más seguro que enviar las keys al frontend.
+app.post('/api/internal/get-clinic-credentials', async (req, res) => {
+    const { userId } = req.body;
+    // ... Lógica para leer web_clinica y devolver SUPABASE_URL y SERVICE_KEY ...
+    // (Similar al bloque D de arriba, pero autenticado con un API KEY interna entre servidores)
 });
 
 app.listen(PORT, () => {
