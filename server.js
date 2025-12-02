@@ -8,7 +8,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // URL DEL SATÉLITE (Proporcionada por ti)
-const SATELLITE_URL = "https://webs-de-vintex-bakend-de-clinica.1kh9sk.easypanel.host";
+const SATELLITE_URL = "https://webs-de-vintex-bakend-de-clinica.1kh9sk.easypanel.host/";
 
 app.use(cors({ origin: '*' }));
 app.use(express.json());
