@@ -28,6 +28,78 @@ const masterSupabase = createClient(
 
 // --- RUTAS ---
 
+// --- RUTA DE REGISTRO (NUEVA) ---
+app.post('/api/register', async (req, res) => {
+  const { email, password, full_name } = req.body;
+
+  try {
+    // 1. Crear usuario en Supabase Auth
+    const { data: authData, error: authError } = await supabase.auth.signUp({
+      email,
+      password,
+      options: {
+        data: { full_name } // Guardamos el nombre en los metadatos
+      }
+    });
+
+    if (authError) throw authError;
+    if (!authData.user) throw new Error("No se pudo crear el usuario en Auth.");
+
+    const userId = authData.user.id;
+
+    // 2. Guardar en tabla 'users' (Gestión del SaaS)
+    const { error: userError } = await supabase
+      .from('users')
+      .insert({
+        id: userId,
+        email: email,
+        full_name: full_name,
+        role: 'admin', // El que se registra es admin de su clínica
+        created_at: new Date()
+      });
+
+    if (userError) throw userError;
+
+    // 3. Inicializar Trial (Prueba Gratuita)
+    const startDate = new Date();
+    const endDate = new Date();
+    endDate.setDate(startDate.getDate() + 14); // 14 días de prueba
+
+    const { error: trialError } = await supabase
+      .from('trials')
+      .insert({
+        user_id: userId,
+        start_date: startDate,
+        end_date: endDate,
+        status: 'active'
+      });
+
+    if (trialError) console.error("Error creando trial:", trialError.message);
+
+    // 4. Inicializar Servicios (Tabla 'servisi') - Por defecto apagados hasta que configure
+    const { error: serviceError } = await supabase
+      .from('servisi')
+      .insert({
+        "ID_User": userId,
+        web_clinica: false,
+        "Bot_clinica": false
+      });
+      
+    if (serviceError) console.error("Error servicios:", serviceError.message);
+
+    // 5. Responder con éxito y la sesión
+    res.status(200).json({
+      message: 'Usuario registrado correctamente',
+      user: authData.user,
+      session: authData.session // Enviamos la sesión para que el front entre directo
+    });
+
+  } catch (error) {
+    console.error("Error en registro:", error.message);
+    res.status(400).json({ error: error.message });
+  }
+});
+
 // 1. REGISTRO (StartTrial)
 app.post('/api/start-trial', async (req, res) => {
     const { email, fullName, phone } = req.body;
