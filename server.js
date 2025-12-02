@@ -5,52 +5,63 @@ import { createClient } from '@supabase/supabase-js';
 import { rateLimit } from 'express-rate-limit';
 import helmet from 'helmet';
 import { z } from 'zod';
+import crypto from 'crypto'; // NUEVO: Para criptografía segura
 
 dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// URL DEL SATÉLITE
-const SATELLITE_URL = "https://webs-de-vintex-bakend-de-clinica.1kh9sk.easypanel.host/";
-// URL DEL FRONTEND (Asegúrate de poner la URL real de tu frontend aquí)
-const FRONTEND_URL = process.env.FRONTEND_URL || "https://tu-dominio-frontend.com";
+const SATELLITE_URL = process.env.SATELLITE_URL || "https://webs-de-vintex-bakend-de-clinica.1kh9sk.easypanel.host/";
+const FRONTEND_URL = process.env.FRONTEND_URL; // DEBE estar definido en .env
+
+if (!FRONTEND_URL) {
+    console.warn("⚠️ ADVERTENCIA: FRONTEND_URL no definido. CORS podría fallar en producción.");
+}
 
 // --- 1. SEGURIDAD: HELMET & CORS ---
-app.use(helmet()); // Headers de seguridad HTTP
+app.use(helmet());
 app.use(cors({
-    origin: [FRONTEND_URL, 'http://localhost:5173'], // Solo permite tu frontend y localhost para dev
+    origin: FRONTEND_URL ? [FRONTEND_URL, 'http://localhost:5173'] : 'http://localhost:5173',
     methods: ['GET', 'POST', 'PATCH', 'DELETE'],
-    allowedHeaders: ['Content-Type', 'Authorization']
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    credentials: true
 }));
-app.use(express.json({ limit: '10kb' })); // Limita el tamaño del body para evitar DoS
+app.use(express.json({ limit: '10kb' }));
 
 // --- 2. SEGURIDAD: RATE LIMITING ---
 const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutos
-    limit: 100, // Máximo 100 peticiones por IP
+    windowMs: 15 * 60 * 1000,
+    limit: 100,
     standardHeaders: 'draft-7',
     legacyHeaders: false,
     message: { error: "Demasiadas peticiones, intenta más tarde." }
 });
 app.use(limiter);
 
-// --- 3. LOGGER SANITIZADO ---
+// --- 3. LOGGER SANITIZADO (CORREGIDO) ---
+const sanitizeLog = (obj) => {
+    if (!obj) return obj;
+    const copy = { ...obj };
+    const sensitiveKeys = ['password', 'token', 'access_token', 'session', 'secret'];
+    
+    Object.keys(copy).forEach(key => {
+        if (sensitiveKeys.includes(key.toLowerCase())) {
+            copy[key] = '***REDACTED***';
+        } else if (typeof copy[key] === 'object' && copy[key] !== null) {
+            copy[key] = sanitizeLog(copy[key]);
+        }
+    });
+    return copy;
+};
+
 app.use((req, res, next) => {
     console.log(`\n🔵 [REQUEST] ${req.method} ${req.url}`);
-    
     if (req.body && Object.keys(req.body).length > 0) {
-        // Clonamos el body para no modificar el original
-        const sanitizedBody = { ...req.body };
-        // Ocultamos datos sensibles
-        if (sanitizedBody.password) sanitizedBody.password = '********';
-        if (sanitizedBody.token) sanitizedBody.token = '********';
-        console.log('   Payload:', JSON.stringify(sanitizedBody, null, 2));
+        console.log('   Payload:', JSON.stringify(sanitizeLog(req.body), null, 2));
     }
-
     next();
 });
 
-// Verificación de variables de entorno
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
     console.error("❌ FALTA CONFIGURACIÓN: SUPABASE_URL o SUPABASE_SERVICE_KEY.");
     process.exit(1);
@@ -65,7 +76,7 @@ const masterSupabase = createClient(
 // --- ESQUEMAS DE VALIDACIÓN ZOD ---
 const registerSchema = z.object({
     email: z.string().email(),
-    password: z.string().min(6),
+    password: z.string().min(8, "La contraseña debe tener al menos 8 caracteres"), // Aumentado a 8
     full_name: z.string().min(2)
 });
 
@@ -80,7 +91,6 @@ const loginSchema = z.object({
     password: z.string()
 });
 
-// Middleware de Validación
 const validate = (schema) => (req, res, next) => {
     try {
         schema.parse(req.body);
@@ -108,6 +118,7 @@ app.post('/api/register', validate(registerSchema), async (req, res) => {
 
     const userId = authData.user.id;
 
+    // Usar transacción o verificar inserciones críticas
     const { error: userError } = await masterSupabase.from('users').insert({
         id: userId,
         email: email,
@@ -118,7 +129,6 @@ app.post('/api/register', validate(registerSchema), async (req, res) => {
 
     if (userError) throw userError;
 
-    // Inicializar Trial y Servicios (Lógica original mantenida)
     const endDate = new Date();
     endDate.setDate(endDate.getDate() + 14);
 
@@ -137,21 +147,22 @@ app.post('/api/register', validate(registerSchema), async (req, res) => {
       
     res.status(200).json({
       message: 'Usuario registrado correctamente',
-      user: authData.user,
+      user: { id: authData.user.id, email: authData.user.email }, // No devolver todo el objeto user
       session: authData.session 
     });
 
   } catch (error) {
-    console.error("Error REAL en registro:", error); // Logueamos el error real
-    // Respondemos genérico al cliente
+    console.error("Error en registro:", error.message); 
     res.status(400).json({ error: 'Error al procesar el registro.' });
   }
 });
 
-// 2. START TRIAL
+// 2. START TRIAL (CON CRIPTOGRAFÍA SEGURA)
 app.post('/api/start-trial', validate(trialSchema), async (req, res) => {
     const { email, fullName, phone } = req.body;
-    const tempPassword = Math.random().toString(36).slice(-8) + "V!1";
+    
+    // CORRECCIÓN: Generación segura de contraseña
+    const tempPassword = crypto.randomBytes(12).toString('hex') + "V!1";
 
     try {
         const { data: authData, error: authError } = await masterSupabase.auth.signUp({
@@ -181,13 +192,12 @@ app.post('/api/start-trial', validate(trialSchema), async (req, res) => {
             "Bot_clinica": false
         });
 
-        // OJO: Aquí deberías enviar el email real, no loguear la password en prod
-        console.log(`[INFO] Usuario Trial creado: ${email}`); 
+        console.log(`[INFO] Usuario Trial creado: ${email}`); // Password NO se loguea
 
         return res.status(201).json({ success: true, message: 'Usuario registrado. Revisa tu email.' });
 
     } catch (error) {
-        console.error("Error REAL trial:", error);
+        console.error("Error trial:", error.message);
         return res.status(500).json({ error: 'Error interno del servidor.' });
     }
 });
@@ -203,15 +213,15 @@ app.post('/api/login', validate(loginSchema), async (req, res) => {
         return res.json({
             success: true,
             session: data.session,
-            user: data.user
+            user: { id: data.user.id, email: data.user.email } // Solo devolver datos necesarios
         });
     } catch (e) {
-        console.error("Error Login:", e);
+        console.error("Error Login:", e.message);
         return res.status(500).json({ error: 'Error interno de autenticación.' });
     }
 });
 
-// 4. INIT SESSION
+// 4. INIT SESSION (CRÍTICO: NO EXICIBIR SERVICE_KEY)
 app.get('/api/config/init-session', async (req, res) => {
     const authHeader = req.headers.authorization;
     if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
@@ -221,9 +231,11 @@ app.get('/api/config/init-session', async (req, res) => {
         const { data: { user }, error } = await masterSupabase.auth.getUser(token);
         if (error || !user) return res.status(401).json({ error: 'Sesión inválida' });
 
+        // Seleccionamos SOLO lo necesario. 
+        // IMPORTANTE: Debes tener una columna 'SUPABASE_ANON_KEY' en tu tabla web_clinica
         const { data: config } = await masterSupabase
             .from('web_clinica')
-            .select('*')
+            .select('SUPABASE_URL, SUPABASE_ANON_KEY') 
             .eq('ID_USER', user.id)
             .single();
         
@@ -235,10 +247,10 @@ app.get('/api/config/init-session', async (req, res) => {
             hasClinic: true,
             backendUrl: SATELLITE_URL, 
             supabaseUrl: config.SUPABASE_URL,
-            supabaseAnonKey: config.SUPABASE_SERVICE_KEY 
+            supabaseAnonKey: config.SUPABASE_ANON_KEY // CORREGIDO: Usar Anon Key
         });
     } catch (e) {
-        console.error("Error Init Session:", e);
+        console.error("Error Init Session:", e.message);
         return res.status(500).json({ error: 'Error recuperando configuración.' });
     }
 });
