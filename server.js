@@ -2,69 +2,105 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
+import { rateLimit } from 'express-rate-limit';
+import helmet from 'helmet';
+import { z } from 'zod';
 
 dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// URL DEL SATÉLITE (Proporcionada por ti)
+// URL DEL SATÉLITE
 const SATELLITE_URL = "https://webs-de-vintex-bakend-de-clinica.1kh9sk.easypanel.host/";
+// URL DEL FRONTEND (Asegúrate de poner la URL real de tu frontend aquí)
+const FRONTEND_URL = process.env.FRONTEND_URL || "https://tu-dominio-frontend.com";
 
-app.use(cors({ origin: '*' }));
-app.use(express.json());
+// --- 1. SEGURIDAD: HELMET & CORS ---
+app.use(helmet()); // Headers de seguridad HTTP
+app.use(cors({
+    origin: [FRONTEND_URL, 'http://localhost:5173'], // Solo permite tu frontend y localhost para dev
+    methods: ['GET', 'POST', 'PATCH', 'DELETE'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
+app.use(express.json({ limit: '10kb' })); // Limita el tamaño del body para evitar DoS
 
-// --- LOGGER MIDDLEWARE (NUEVO) ---
-// Muestra en consola todas las peticiones entrantes y las respuestas salientes
+// --- 2. SEGURIDAD: RATE LIMITING ---
+const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutos
+    limit: 100, // Máximo 100 peticiones por IP
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    message: { error: "Demasiadas peticiones, intenta más tarde." }
+});
+app.use(limiter);
+
+// --- 3. LOGGER SANITIZADO ---
 app.use((req, res, next) => {
-    // 1. Loguear la petición (Request)
     console.log(`\n🔵 [REQUEST] ${req.method} ${req.url}`);
+    
     if (req.body && Object.keys(req.body).length > 0) {
-        console.log('   Payload:', JSON.stringify(req.body, null, 2));
-    } else {
-        console.log('   Payload: (vacío)');
+        // Clonamos el body para no modificar el original
+        const sanitizedBody = { ...req.body };
+        // Ocultamos datos sensibles
+        if (sanitizedBody.password) sanitizedBody.password = '********';
+        if (sanitizedBody.token) sanitizedBody.token = '********';
+        console.log('   Payload:', JSON.stringify(sanitizedBody, null, 2));
     }
-
-    // 2. Interceptar la respuesta (Response)
-    const originalJson = res.json;
-    res.json = function (body) {
-        console.log(`fq [RESPONSE] Status: ${res.statusCode}`);
-        if (body) {
-            console.log('   Body:', JSON.stringify(body, null, 2));
-        }
-        return originalJson.call(this, body);
-    };
 
     next();
 });
-// ---------------------------------
 
 // Verificación de variables de entorno
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
-    console.error("❌ FALTA CONFIGURACIÓN: SUPABASE_URL o SUPABASE_SERVICE_KEY en Master.");
+    console.error("❌ FALTA CONFIGURACIÓN: SUPABASE_URL o SUPABASE_SERVICE_KEY.");
     process.exit(1);
 }
 
-// Cliente Maestro
 const masterSupabase = createClient(
   process.env.SUPABASE_URL, 
   process.env.SUPABASE_SERVICE_KEY,
   { auth: { autoRefreshToken: false, persistSession: false } }
 );
 
+// --- ESQUEMAS DE VALIDACIÓN ZOD ---
+const registerSchema = z.object({
+    email: z.string().email(),
+    password: z.string().min(6),
+    full_name: z.string().min(2)
+});
+
+const trialSchema = z.object({
+    email: z.string().email(),
+    fullName: z.string().min(2),
+    phone: z.string().min(8)
+});
+
+const loginSchema = z.object({
+    email: z.string().email(),
+    password: z.string()
+});
+
+// Middleware de Validación
+const validate = (schema) => (req, res, next) => {
+    try {
+        schema.parse(req.body);
+        next();
+    } catch (e) {
+        return res.status(400).json({ error: 'Datos inválidos', details: e.errors });
+    }
+};
+
 // --- RUTAS ---
 
-// 1. RUTA DE REGISTRO COMPLETA (Corregida)
-app.post('/api/register', async (req, res) => {
+// 1. REGISTRO
+app.post('/api/register', validate(registerSchema), async (req, res) => {
   const { email, password, full_name } = req.body;
 
   try {
-    // A. Crear usuario en Supabase Auth (Usando masterSupabase)
     const { data: authData, error: authError } = await masterSupabase.auth.signUp({
       email,
       password,
-      options: {
-        data: { full_name } // Guardamos el nombre en los metadatos
-      }
+      options: { data: { full_name } }
     });
 
     if (authError) throw authError;
@@ -72,47 +108,33 @@ app.post('/api/register', async (req, res) => {
 
     const userId = authData.user.id;
 
-    // B. Guardar en tabla 'users' (Gestión del SaaS)
-    const { error: userError } = await masterSupabase
-      .from('users')
-      .insert({
+    const { error: userError } = await masterSupabase.from('users').insert({
         id: userId,
         email: email,
         full_name: full_name,
-        role: 'admin', // El que se registra es admin de su clínica
+        role: 'admin',
         created_at: new Date()
-      });
+    });
 
     if (userError) throw userError;
 
-    // C. Inicializar Trial (Prueba Gratuita)
-    const startDate = new Date();
+    // Inicializar Trial y Servicios (Lógica original mantenida)
     const endDate = new Date();
-    endDate.setDate(startDate.getDate() + 14); // 14 días de prueba
+    endDate.setDate(endDate.getDate() + 14);
 
-    const { error: trialError } = await masterSupabase
-      .from('trials')
-      .insert({
+    await masterSupabase.from('trials').insert({
         user_id: userId,
-        start_date: startDate,
+        start_date: new Date(),
         end_date: endDate,
         status: 'active'
-      });
+    });
 
-    if (trialError) console.error("Error creando trial:", trialError.message);
-
-    // D. Inicializar Servicios (Tabla 'servisi')
-    const { error: serviceError } = await masterSupabase
-      .from('servisi')
-      .insert({
+    await masterSupabase.from('servisi').insert({
         "ID_User": userId,
         web_clinica: false,
         "Bot_clinica": false
-      });
+    });
       
-    if (serviceError) console.error("Error servicios:", serviceError.message);
-
-    // E. Responder con éxito y la sesión
     res.status(200).json({
       message: 'Usuario registrado correctamente',
       user: authData.user,
@@ -120,31 +142,29 @@ app.post('/api/register', async (req, res) => {
     });
 
   } catch (error) {
-    console.error("Error en registro:", error.message);
-    res.status(400).json({ error: error.message });
+    console.error("Error REAL en registro:", error); // Logueamos el error real
+    // Respondemos genérico al cliente
+    res.status(400).json({ error: 'Error al procesar el registro.' });
   }
 });
 
-// 2. START TRIAL (Registro alternativo rápido)
-app.post('/api/start-trial', async (req, res) => {
+// 2. START TRIAL
+app.post('/api/start-trial', validate(trialSchema), async (req, res) => {
     const { email, fullName, phone } = req.body;
-    // Generamos password temporal
     const tempPassword = Math.random().toString(36).slice(-8) + "V!1";
 
     try {
-        // A. Crear Auth User
         const { data: authData, error: authError } = await masterSupabase.auth.signUp({
             email,
             password: tempPassword,
             options: { data: { full_name: fullName, phone } }
         });
 
-        if (authError) return res.status(400).json({ error: authError.message });
-        if (!authData.user) return res.status(400).json({ error: 'No se pudo crear el usuario.' });
+        if (authError) throw authError;
+        if (!authData.user) throw new Error('No se pudo crear el usuario.');
 
         const userId = authData.user.id;
 
-        // B. Insertar en tabla users
         const { error: dbError } = await masterSupabase.from('users').insert({
             id: userId,
             email: email,
@@ -155,25 +175,25 @@ app.post('/api/start-trial', async (req, res) => {
 
         if (dbError) throw dbError;
 
-        // C. Crear servicios por defecto
         await masterSupabase.from('servisi').insert({
             "ID_User": userId,
             web_clinica: false, 
             "Bot_clinica": false
         });
 
-        console.log(`Usuario creado (Trial): ${email} | Pass: ${tempPassword}`);
+        // OJO: Aquí deberías enviar el email real, no loguear la password en prod
+        console.log(`[INFO] Usuario Trial creado: ${email}`); 
 
         return res.status(201).json({ success: true, message: 'Usuario registrado. Revisa tu email.' });
 
     } catch (error) {
-        console.error(error);
+        console.error("Error REAL trial:", error);
         return res.status(500).json({ error: 'Error interno del servidor.' });
     }
 });
 
 // 3. LOGIN
-app.post('/api/login', async (req, res) => {
+app.post('/api/login', validate(loginSchema), async (req, res) => {
     const { email, password } = req.body;
 
     try {
@@ -186,11 +206,12 @@ app.post('/api/login', async (req, res) => {
             user: data.user
         });
     } catch (e) {
-        return res.status(500).json({ error: e.message });
+        console.error("Error Login:", e);
+        return res.status(500).json({ error: 'Error interno de autenticación.' });
     }
 });
 
-// 4. INIT SESSION (Ruteo Inteligente)
+// 4. INIT SESSION
 app.get('/api/config/init-session', async (req, res) => {
     const authHeader = req.headers.authorization;
     if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
@@ -200,7 +221,6 @@ app.get('/api/config/init-session', async (req, res) => {
         const { data: { user }, error } = await masterSupabase.auth.getUser(token);
         if (error || !user) return res.status(401).json({ error: 'Sesión inválida' });
 
-        // Buscar config de la clínica en Master DB
         const { data: config } = await masterSupabase
             .from('web_clinica')
             .select('*')
@@ -208,7 +228,6 @@ app.get('/api/config/init-session', async (req, res) => {
             .single();
         
         if (!config) {
-             // Si no tiene clínica configurada, no devolvemos backendUrl
              return res.status(200).json({ hasClinic: false });
         }
 
@@ -219,11 +238,11 @@ app.get('/api/config/init-session', async (req, res) => {
             supabaseAnonKey: config.SUPABASE_SERVICE_KEY 
         });
     } catch (e) {
-        console.error(e);
-        return res.status(500).json({ error: e.message });
+        console.error("Error Init Session:", e);
+        return res.status(500).json({ error: 'Error recuperando configuración.' });
     }
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 MASTER SERVER en puerto ${PORT}`);
+  console.log(`🚀 MASTER SERVER SECURE en puerto ${PORT}`);
 });
