@@ -5,20 +5,16 @@ import { createClient } from '@supabase/supabase-js';
 import { rateLimit } from 'express-rate-limit';
 import helmet from 'helmet';
 import { z } from 'zod';
-import crypto from 'crypto'; // NUEVO: Para criptografía segura
+import crypto from 'crypto';
 
 dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 const SATELLITE_URL = process.env.SATELLITE_URL || "https://webs-de-vintex-bakend-de-clinica.1kh9sk.easypanel.host/";
-const FRONTEND_URL = process.env.FRONTEND_URL; // DEBE estar definido en .env
+const FRONTEND_URL = process.env.FRONTEND_URL;
 
-if (!FRONTEND_URL) {
-    console.warn("⚠️ ADVERTENCIA: FRONTEND_URL no definido. CORS podría fallar en producción.");
-}
-
-// --- 1. SEGURIDAD: HELMET & CORS ---
+// --- 1. SEGURIDAD ---
 app.use(helmet());
 app.use(cors({
     origin: FRONTEND_URL ? [FRONTEND_URL, 'http://localhost:5173'] : 'http://localhost:5173',
@@ -26,24 +22,21 @@ app.use(cors({
     allowedHeaders: ['Content-Type', 'Authorization'],
     credentials: true
 }));
-app.use(express.json({ limit: '10kb' }));
+app.use(express.json({ limit: '10kb' })); // DoS Protection JSON
 
-// --- 2. SEGURIDAD: RATE LIMITING ---
+// Rate Limit
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     limit: 100,
-    standardHeaders: 'draft-7',
-    legacyHeaders: false,
-    message: { error: "Demasiadas peticiones, intenta más tarde." }
+    message: { error: "Demasiadas peticiones." }
 });
 app.use(limiter);
 
-// --- 3. LOGGER SANITIZADO (CORREGIDO) ---
+// Logger Sanitizado
 const sanitizeLog = (obj) => {
     if (!obj) return obj;
     const copy = { ...obj };
     const sensitiveKeys = ['password', 'token', 'access_token', 'session', 'secret'];
-    
     Object.keys(copy).forEach(key => {
         if (sensitiveKeys.includes(key.toLowerCase())) {
             copy[key] = '***REDACTED***';
@@ -73,10 +66,10 @@ const masterSupabase = createClient(
   { auth: { autoRefreshToken: false, persistSession: false } }
 );
 
-// --- ESQUEMAS DE VALIDACIÓN ZOD ---
+// Esquemas Zod
 const registerSchema = z.object({
     email: z.string().email(),
-    password: z.string().min(8, "La contraseña debe tener al menos 8 caracteres"), // Aumentado a 8
+    password: z.string().min(8, "Contraseña insegura"),
     full_name: z.string().min(2)
 });
 
@@ -100,12 +93,10 @@ const validate = (schema) => (req, res, next) => {
     }
 };
 
-// --- RUTAS ---
+// RUTAS
 
-// 1. REGISTRO
 app.post('/api/register', validate(registerSchema), async (req, res) => {
   const { email, password, full_name } = req.body;
-
   try {
     const { data: authData, error: authError } = await masterSupabase.auth.signUp({
       email,
@@ -114,11 +105,10 @@ app.post('/api/register', validate(registerSchema), async (req, res) => {
     });
 
     if (authError) throw authError;
-    if (!authData.user) throw new Error("No se pudo crear el usuario en Auth.");
+    if (!authData.user) throw new Error("Error en creación de usuario.");
 
     const userId = authData.user.id;
 
-    // Usar transacción o verificar inserciones críticas
     const { error: userError } = await masterSupabase.from('users').insert({
         id: userId,
         email: email,
@@ -147,22 +137,20 @@ app.post('/api/register', validate(registerSchema), async (req, res) => {
       
     res.status(200).json({
       message: 'Usuario registrado correctamente',
-      user: { id: authData.user.id, email: authData.user.email }, // No devolver todo el objeto user
+      user: { id: authData.user.id, email: authData.user.email },
       session: authData.session 
     });
 
   } catch (error) {
-    console.error("Error en registro:", error.message); 
+    console.error("Registro error:", error.message); 
     res.status(400).json({ error: 'Error al procesar el registro.' });
   }
 });
 
-// 2. START TRIAL (CON CRIPTOGRAFÍA SEGURA)
 app.post('/api/start-trial', validate(trialSchema), async (req, res) => {
     const { email, fullName, phone } = req.body;
-    
-    // CORRECCIÓN: Generación segura de contraseña
-    const tempPassword = crypto.randomBytes(12).toString('hex') + "V!1";
+    // Crypto Safe Random Password
+    const tempPassword = crypto.randomBytes(16).toString('hex') + "V!1";
 
     try {
         const { data: authData, error: authError } = await masterSupabase.auth.signUp({
@@ -172,11 +160,9 @@ app.post('/api/start-trial', validate(trialSchema), async (req, res) => {
         });
 
         if (authError) throw authError;
-        if (!authData.user) throw new Error('No se pudo crear el usuario.');
-
         const userId = authData.user.id;
 
-        const { error: dbError } = await masterSupabase.from('users').insert({
+        await masterSupabase.from('users').insert({
             id: userId,
             email: email,
             full_name: fullName,
@@ -184,36 +170,36 @@ app.post('/api/start-trial', validate(trialSchema), async (req, res) => {
             role: 'admin'
         });
 
-        if (dbError) throw dbError;
-
         await masterSupabase.from('servisi').insert({
             "ID_User": userId,
             web_clinica: false, 
             "Bot_clinica": false
         });
 
-        console.log(`[INFO] Usuario Trial creado: ${email}`); // Password NO se loguea
-
+        console.log(`[INFO] Usuario Trial creado: ${email}`); 
         return res.status(201).json({ success: true, message: 'Usuario registrado. Revisa tu email.' });
 
     } catch (error) {
-        console.error("Error trial:", error.message);
+        console.error("Trial error:", error.message);
         return res.status(500).json({ error: 'Error interno del servidor.' });
     }
 });
 
-// 3. LOGIN
+// Login con User Enumeration Protection
 app.post('/api/login', validate(loginSchema), async (req, res) => {
     const { email, password } = req.body;
-
     try {
         const { data, error } = await masterSupabase.auth.signInWithPassword({ email, password });
-        if (error || !data.user) return res.status(401).json({ error: 'Credenciales inválidas' });
+        
+        // Mensaje GENÉRICO para evitar enumeración
+        if (error || !data.user) {
+            return res.status(401).json({ error: 'Credenciales inválidas' });
+        }
 
         return res.json({
             success: true,
             session: data.session,
-            user: { id: data.user.id, email: data.user.email } // Solo devolver datos necesarios
+            user: { id: data.user.id, email: data.user.email }
         });
     } catch (e) {
         console.error("Error Login:", e.message);
@@ -221,7 +207,6 @@ app.post('/api/login', validate(loginSchema), async (req, res) => {
     }
 });
 
-// 4. INIT SESSION (CRÍTICO: NO EXICIBIR SERVICE_KEY)
 app.get('/api/config/init-session', async (req, res) => {
     const authHeader = req.headers.authorization;
     if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
@@ -231,8 +216,7 @@ app.get('/api/config/init-session', async (req, res) => {
         const { data: { user }, error } = await masterSupabase.auth.getUser(token);
         if (error || !user) return res.status(401).json({ error: 'Sesión inválida' });
 
-        // Seleccionamos SOLO lo necesario. 
-        // IMPORTANTE: Debes tener una columna 'SUPABASE_ANON_KEY' en tu tabla web_clinica
+        // SOLUCIÓN CRÍTICA: Devolver ANON KEY, no Service Key.
         const { data: config } = await masterSupabase
             .from('web_clinica')
             .select('SUPABASE_URL, SUPABASE_ANON_KEY') 
@@ -247,7 +231,7 @@ app.get('/api/config/init-session', async (req, res) => {
             hasClinic: true,
             backendUrl: SATELLITE_URL, 
             supabaseUrl: config.SUPABASE_URL,
-            supabaseAnonKey: config.SUPABASE_ANON_KEY // CORREGIDO: Usar Anon Key
+            supabaseAnonKey: config.SUPABASE_ANON_KEY 
         });
     } catch (e) {
         console.error("Error Init Session:", e.message);
