@@ -18,6 +18,7 @@ const PORT = process.env.PORT || 3000;
 // CONFIGURACIÓN DE DOMINIOS (PRODUCCIÓN)
 // Apuntamos al subdominio seguro del satélite
 const SATELLITE_URL = process.env.SATELLITE_URL || "https://api-clinica.vintex.net.br";
+// El frontend que consume esta API
 const FRONTEND_URL = process.env.FRONTEND_URL || "https://vintex.net.br";
 
 // --- SEGURIDAD: HELMET & CORS ---
@@ -233,7 +234,7 @@ app.get('/api/config/init-session', async (req, res) => {
 
         return res.json({
             hasClinic: true,
-            backendUrl: SATELLITE_URL, 
+            backendUrl: SATELLITE_URL, // Ahora es https://api-clinica.vintex.net.br
             supabaseUrl: config.SUPABASE_URL,
             supabaseAnonKey: config.SUPABASE_ANON_KEY 
         });
@@ -244,5 +245,5 @@ app.get('/api/config/init-session', async (req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 MASTER SERVER (Vintex.net.br) en puerto ${PORT}`);
+  console.log(`🚀 MASTER SERVER (api-master.vintex.net.br) en puerto ${PORT}`);
 });
