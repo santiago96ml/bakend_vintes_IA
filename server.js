@@ -9,6 +9,7 @@ import crypto from 'crypto';
 
 dotenv.config();
 const app = express();
+app.set('trust proxy', 1); // CORRECCIÓN: Necesario para Rate Limit detrás de proxy
 const PORT = process.env.PORT || 3000;
 
 const SATELLITE_URL = process.env.SATELLITE_URL || "https://webs-de-vintex-bakend-de-clinica.1kh9sk.easypanel.host/";
@@ -36,7 +37,8 @@ app.use(limiter);
 const sanitizeLog = (obj) => {
     if (!obj) return obj;
     const copy = { ...obj };
-    const sensitiveKeys = ['password', 'token', 'access_token', 'session', 'secret'];
+    // CORRECCIÓN: Lista ampliada con PII (dni, telefono, email, etc.)
+    const sensitiveKeys = ['password', 'token', 'access_token', 'session', 'secret', 'dni', 'credit_card', 'cvv', 'phone', 'telefono', 'email'];
     Object.keys(copy).forEach(key => {
         if (sensitiveKeys.includes(key.toLowerCase())) {
             copy[key] = '***REDACTED***';
