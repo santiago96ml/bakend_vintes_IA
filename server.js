@@ -9,23 +9,30 @@ import crypto from 'crypto';
 
 dotenv.config();
 const app = express();
-app.set('trust proxy', 1); // CORRECCIÓN: Necesario para Rate Limit detrás de proxy
+
+// 1. TRUST PROXY: Vital para que Cloudflare funcione correctamente
+app.set('trust proxy', 1); 
+
 const PORT = process.env.PORT || 3000;
 
-const SATELLITE_URL = process.env.SATELLITE_URL || "https://webs-de-vintex-bakend-de-clinica.1kh9sk.easypanel.host/";
-const FRONTEND_URL = process.env.FRONTEND_URL;
+// CONFIGURACIÓN DE DOMINIOS (PRODUCCIÓN)
+// Apuntamos al subdominio seguro del satélite
+const SATELLITE_URL = process.env.SATELLITE_URL || "https://api-clinica.vintex.net.br";
+const FRONTEND_URL = process.env.FRONTEND_URL || "https://vintex.net.br";
 
-// --- 1. SEGURIDAD ---
+// --- SEGURIDAD: HELMET & CORS ---
 app.use(helmet());
 app.use(cors({
-    origin: FRONTEND_URL ? [FRONTEND_URL, 'http://localhost:5173'] : 'http://localhost:5173',
+    // Permitimos explícitamente tu dominio de producción y localhost para desarrollo
+    origin: [FRONTEND_URL, 'https://vintex.net.br', 'http://localhost:5173'],
     methods: ['GET', 'POST', 'PATCH', 'DELETE'],
     allowedHeaders: ['Content-Type', 'Authorization'],
     credentials: true
 }));
-app.use(express.json({ limit: '10kb' })); // DoS Protection JSON
 
-// Rate Limit
+app.use(express.json({ limit: '10kb' })); // Anti-DoS
+
+// Rate Limiting
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     limit: 100,
@@ -33,11 +40,10 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
-// Logger Sanitizado
+// Logger Sanitizado (Protección de Datos Sensibles)
 const sanitizeLog = (obj) => {
     if (!obj) return obj;
     const copy = { ...obj };
-    // CORRECCIÓN: Lista ampliada con PII (dni, telefono, email, etc.)
     const sensitiveKeys = ['password', 'token', 'access_token', 'session', 'secret', 'dni', 'credit_card', 'cvv', 'phone', 'telefono', 'email'];
     Object.keys(copy).forEach(key => {
         if (sensitiveKeys.includes(key.toLowerCase())) {
@@ -68,7 +74,7 @@ const masterSupabase = createClient(
   { auth: { autoRefreshToken: false, persistSession: false } }
 );
 
-// Esquemas Zod
+// Esquemas de Validación
 const registerSchema = z.object({
     email: z.string().email(),
     password: z.string().min(8, "Contraseña insegura"),
@@ -95,7 +101,7 @@ const validate = (schema) => (req, res, next) => {
     }
 };
 
-// RUTAS
+// --- RUTAS ---
 
 app.post('/api/register', validate(registerSchema), async (req, res) => {
   const { email, password, full_name } = req.body;
@@ -151,7 +157,6 @@ app.post('/api/register', validate(registerSchema), async (req, res) => {
 
 app.post('/api/start-trial', validate(trialSchema), async (req, res) => {
     const { email, fullName, phone } = req.body;
-    // Crypto Safe Random Password
     const tempPassword = crypto.randomBytes(16).toString('hex') + "V!1";
 
     try {
@@ -187,13 +192,11 @@ app.post('/api/start-trial', validate(trialSchema), async (req, res) => {
     }
 });
 
-// Login con User Enumeration Protection
 app.post('/api/login', validate(loginSchema), async (req, res) => {
     const { email, password } = req.body;
     try {
         const { data, error } = await masterSupabase.auth.signInWithPassword({ email, password });
         
-        // Mensaje GENÉRICO para evitar enumeración
         if (error || !data.user) {
             return res.status(401).json({ error: 'Credenciales inválidas' });
         }
@@ -218,7 +221,6 @@ app.get('/api/config/init-session', async (req, res) => {
         const { data: { user }, error } = await masterSupabase.auth.getUser(token);
         if (error || !user) return res.status(401).json({ error: 'Sesión inválida' });
 
-        // SOLUCIÓN CRÍTICA: Devolver ANON KEY, no Service Key.
         const { data: config } = await masterSupabase
             .from('web_clinica')
             .select('SUPABASE_URL, SUPABASE_ANON_KEY') 
@@ -242,5 +244,5 @@ app.get('/api/config/init-session', async (req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 MASTER SERVER SECURE en puerto ${PORT}`);
+  console.log(`🚀 MASTER SERVER (Vintex.net.br) en puerto ${PORT}`);
 });
