@@ -6,7 +6,7 @@ import { rateLimit } from 'express-rate-limit';
 import helmet from 'helmet';
 import { z } from 'zod';
 import crypto from 'crypto';
-import OpenAI from 'openai'; // Necesitas instalar: npm install openai
+import OpenAI from 'openai'; 
 
 dotenv.config();
 const app = express();
@@ -18,7 +18,7 @@ const PORT = process.env.PORT || 3000;
 
 // --- CONFIGURACIÓN CRIPTOGRAFÍA ---
 if (!process.env.MASTER_ENCRYPTION_KEY) {
-    console.error("⚠️ ADVERTENCIA: Falta MASTER_ENCRYPTION_KEY.");
+    console.warn("⚠️ ADVERTENCIA: Falta MASTER_ENCRYPTION_KEY. Usando clave temporal insegura.");
 }
 const ENCRYPTION_KEY = process.env.MASTER_ENCRYPTION_KEY 
     ? Buffer.from(process.env.MASTER_ENCRYPTION_KEY, 'hex') 
@@ -46,23 +46,29 @@ function decrypt(text) {
     return decrypted.toString();
 }
 
-// --- CONFIGURACIÓN OPENAI ---
-// Instanciar cliente solo si existe la key, sino advertir
+// --- CONFIGURACIÓN OPENROUTER (DEEPSEEK) ---
 let openai;
-if (process.env.OPENAI_API_KEY) {
-    openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+if (process.env.OPENROUTER_API_KEY) {
+    openai = new OpenAI({ 
+        apiKey: process.env.OPENROUTER_API_KEY,
+        baseURL: "https://openrouter.ai/api/v1", 
+        defaultHeaders: {
+            "HTTP-Referer": process.env.FRONTEND_URL || "https://vintex.net.br",
+            "X-Title": "Vintex AI",
+        }
+    });
 } else {
-    console.error("❌ FALTA OPENAI_API_KEY en .env");
+    console.error("❌ FALTA OPENROUTER_API_KEY en .env");
 }
 
 // --- DOMINIOS PERMITIDOS ---
 const SATELLITE_URL = process.env.SATELLITE_URL || "https://api-clinica.vintex.net.br";
 const FRONTEND_URL = process.env.FRONTEND_URL || "https://vintex.net.br";
-const ALLOWED_ORIGINS = [FRONTEND_URL, 'https://vintex.net.br', 'http://localhost:5173'];
+const ALLOWED_ORIGINS = [FRONTEND_URL, 'https://vintex.net.br', 'http://localhost:5173', 'http://localhost:3000'];
 
 // --- MIDDLEWARES SEGURIDAD ---
 
-// 1. Helmet (Cabeceras Seguras)
+// 1. Helmet
 app.use(helmet({
   contentSecurityPolicy: {
     directives: {
@@ -78,61 +84,53 @@ app.use(helmet({
   }
 }));
 
-// 2. CORS
+// 2. CORS (Limpiamos cabeceras de WhatsApp)
 app.use(cors({
     origin: (origin, callback) => {
         if (!origin || ALLOWED_ORIGINS.includes(origin)) {
             callback(null, true);
         } else {
+            console.warn(`Bloqueo CORS para origen: ${origin}`);
             callback(new Error('Bloqueado por CORS'));
         }
     },
     methods: ['GET', 'POST', 'PATCH', 'DELETE'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'x-internal-secret', 'x-hub-signature-256'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-internal-secret'], // Quitamos x-hub-signature-256
     credentials: true
 }));
 
-// 3. Body Parser con Límite (Anti-DoS)
-// Usamos verify para capturar el rawBody necesario para la validación del Webhook de Meta
-app.use(express.json({ 
-    limit: '10kb',
-    verify: (req, res, buf, encoding) => {
-        req.rawBody = buf.toString(encoding || 'utf8');
-    }
-}));
+// 3. Body Parser (Simplificado, ya no necesitamos rawBody)
+app.use(express.json({ limit: '10kb' }));
 
-// 4. Rate Limit General
+// 4. Rate Limits
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    limit: 150, 
+    limit: 300, 
     message: { error: "Demasiadas peticiones." },
     standardHeaders: true,
     legacyHeaders: false,
 });
 app.use(limiter);
 
-// 5. Rate Limit Auth
 const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    limit: 20, 
+    limit: 50, 
     message: { error: "Demasiados intentos de autenticación." }
 });
 
-// 6. Rate Limit CHAT (Anti Bill Shock - CRÍTICO)
-// Límite estricto: 50 mensajes cada 3 horas por IP para usuarios autenticados
 const chatLimiter = rateLimit({
-    windowMs: 3 * 60 * 60 * 1000, // 3 horas
-    limit: 50, 
-    message: { error: "Límite de chat excedido. Protegiendo recursos." },
+    windowMs: 3 * 60 * 60 * 1000, 
+    limit: 100, 
+    message: { error: "Límite de chat excedido." },
     standardHeaders: true,
     legacyHeaders: false,
 });
 
-// 7. Logger Sanitizado
+// 5. Logger Sanitizado
 const sanitizeLog = (obj) => {
     if (!obj) return obj;
     const copy = { ...obj };
-    const sensitiveKeys = ['password', 'token', 'access_token', 'session', 'secret', 'dni', 'credit_card', 'cvv', 'phone', 'telefono', 'email', 'supab_service_key', 'jwt_secret', 'messages']; // Añadido messages para privacidad médica
+    const sensitiveKeys = ['password', 'token', 'access_token', 'session', 'secret', 'dni', 'credit_card', 'cvv', 'phone', 'telefono', 'email', 'supab_service_key', 'jwt_secret', 'messages'];
     Object.keys(copy).forEach(key => {
         if (sensitiveKeys.includes(key.toLowerCase())) {
             copy[key] = '***REDACTED***';
@@ -145,10 +143,8 @@ const sanitizeLog = (obj) => {
 
 app.use((req, res, next) => {
     console.log(`\n🔵 [REQUEST] ${req.method} ${req.url}`);
-    if (req.body && Object.keys(req.body).length > 0) {
-        if (process.env.NODE_ENV !== 'production') {
-             console.log('   Payload:', JSON.stringify(sanitizeLog(req.body), null, 2));
-        }
+    if (req.body && Object.keys(req.body).length > 0 && process.env.NODE_ENV !== 'production') {
+         console.log('   Payload:', JSON.stringify(sanitizeLog(req.body), null, 2));
     }
     next();
 });
@@ -172,6 +168,7 @@ const registerSchema = z.object({
     full_name: z.string().min(2)
 });
 
+// ✅ RECUPERADO: Schema para Trial
 const trialSchema = z.object({
     email: z.string().email(),
     fullName: z.string().min(2),
@@ -184,8 +181,14 @@ const loginSchema = z.object({
 });
 
 const chatSchema = z.object({
-    message: z.string().min(1).max(2000), // Límite de caracteres
-    threadId: z.string().optional()
+    message: z.string().min(1).max(2000),
+    threadId: z.string().optional() 
+});
+
+const onboardingSchema = z.object({
+    companyName: z.string().min(2, "Nombre de empresa muy corto"),
+    description: z.string().min(10, "Describe mejor tu empresa para la IA"),
+    requirements: z.string().optional()
 });
 
 const validate = (schema) => (req, res, next) => {
@@ -197,7 +200,7 @@ const validate = (schema) => (req, res, next) => {
     }
 };
 
-// --- MIDDLEWARE AUTENTICACIÓN (Para Chat) ---
+// --- MIDDLEWARE AUTENTICACIÓN ---
 const requireAuth = async (req, res, next) => {
     const authHeader = req.headers.authorization;
     if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
@@ -213,25 +216,20 @@ const requireAuth = async (req, res, next) => {
     }
 };
 
-// --- FUNCIÓN ANTI PROMPT INJECTION ---
+// --- ANTI PROMPT INJECTION ---
 const detectPromptInjection = (text) => {
     const patterns = [
-        /ignore previous instructions/i,
-        /ignora tus instrucciones/i,
-        /system prompt/i,
-        /act as a/i,
-        /actúa como/i,
-        /reset instructions/i
+        /ignore previous instructions/i, /ignora tus instrucciones/i,
+        /system prompt/i, /act as a/i, /actúa como/i, /reset instructions/i
     ];
     return patterns.some(pattern => pattern.test(text));
 };
 
 // =================================================================
-// RUTAS DE NEGOCIO (Usuarios, Auth)
+// RUTAS DE NEGOCIO
 // =================================================================
 
 app.post('/api/register', authLimiter, validate(registerSchema), async (req, res) => {
-  // ... (Código original de registro se mantiene igual)
   const { email, password, full_name } = req.body;
   try {
     const { data: authData, error: authError } = await masterSupabase.auth.signUp({
@@ -244,16 +242,13 @@ app.post('/api/register', authLimiter, validate(registerSchema), async (req, res
     const { error: userError } = await masterSupabase.from('users').insert({
         id: userId, email, full_name, role: 'admin', created_at: new Date()
     });
-    if (userError) throw userError;
+    
+    if (userError) console.error("Error insertando user profile:", userError);
 
-    const endDate = new Date();
-    endDate.setDate(endDate.getDate() + 14);
-    await masterSupabase.from('trials').insert({
-        user_id: userId, start_date: new Date(), end_date: endDate, status: 'active'
-    });
     await masterSupabase.from('servisi').insert({
         "ID_User": userId, web_clinica: false, "Bot_clinica": false
     });
+
     res.status(200).json({
       message: 'Usuario registrado correctamente',
       user: { id: authData.user.id, email: authData.user.email },
@@ -265,8 +260,8 @@ app.post('/api/register', authLimiter, validate(registerSchema), async (req, res
   }
 });
 
+// ✅ RECUPERADA: Ruta para Start Trial
 app.post('/api/start-trial', authLimiter, validate(trialSchema), async (req, res) => {
-    // ... (Código original trial se mantiene igual)
     const { email, fullName, phone } = req.body;
     const tempPassword = crypto.randomBytes(16).toString('hex') + "V!1";
     try {
@@ -290,7 +285,6 @@ app.post('/api/start-trial', authLimiter, validate(trialSchema), async (req, res
 });
 
 app.post('/api/login', authLimiter, validate(loginSchema), async (req, res) => {
-    // ... (Código original login se mantiene igual)
     const { email, password } = req.body;
     try {
         const { data, error } = await masterSupabase.auth.signInWithPassword({ email, password });
@@ -309,152 +303,92 @@ app.post('/api/login', authLimiter, validate(loginSchema), async (req, res) => {
 });
 
 // =================================================================
-// RUTAS NUEVAS: CHAT CON IA (Protegidas)
+// RUTA DE AUTOMATIZACIÓN (Onboarding + n8n)
+// =================================================================
+
+app.post('/api/onboarding/complete', requireAuth, validate(onboardingSchema), async (req, res) => {
+    const { companyName, description } = req.body;
+    const user = req.user;
+    const N8N_URL = process.env.N8N_DEPLOY_WEBHOOK_URL; 
+
+    if (!N8N_URL) {
+        console.error("❌ ERROR CRÍTICO: Faltan N8N_DEPLOY_WEBHOOK_URL en .env");
+        return res.status(500).json({ error: "Error de configuración del sistema." });
+    }
+
+    try {
+        console.log(`🚀 [AUTOMATION] Iniciando despliegue para Usuario: ${user.id}`);
+
+        const { error: updateError } = await masterSupabase.from('users').update({ 
+            subscription_status: 'active',
+            plan_type: 'pro',
+            last_payment_date: new Date(),
+        }).eq('id', user.id);
+
+        if (updateError) console.warn("Advertencia al actualizar usuario:", updateError.message);
+
+        const payload = {
+            userId: user.id,
+            email: user.email,
+            companyName: companyName,
+            description: description,
+            source: "web_onboarding"
+        };
+
+        fetch(N8N_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        })
+        .then(response => {
+            if (!response.ok) console.error(`⚠️ n8n respondió con error: ${response.status}`);
+            else console.log("✅ Webhook n8n entregado correctamente.");
+        })
+        .catch(err => console.error("🔥 Error contactando a n8n:", err.message));
+
+        res.json({ success: true, message: "Despliegue iniciado." });
+
+    } catch (error) {
+        console.error("Error Fatal en Onboarding:", error);
+        res.status(500).json({ error: "Error procesando el despliegue." });
+    }
+});
+
+// =================================================================
+// 🧠 RUTA CHAT IA (OpenRouter / DeepSeek)
 // =================================================================
 
 app.post('/chat', requireAuth, chatLimiter, validate(chatSchema), async (req, res) => {
-    const { message, threadId } = req.body;
+    const { message } = req.body; 
     const userId = req.user.id;
 
-    // 1. Detección de Prompt Injection
     if (detectPromptInjection(message)) {
         console.warn(`[SECURITY] Prompt Injection detectado User: ${userId}`);
         return res.status(400).json({ error: "Entrada no permitida." });
     }
 
     try {
-        // 2. Validación de Propiedad del Hilo (Evitar Hijacking)
-        let safeThreadId = threadId;
-
-        if (threadId) {
-            // Verificar en BD que el thread pertenece al usuario
-            const { data: threadData } = await masterSupabase
-                .from('chat_threads')
-                .select('id')
-                .eq('openai_thread_id', threadId)
-                .eq('user_id', userId)
-                .single();
-            
-            if (!threadData) {
-                // Si el thread no es suyo, creamos uno nuevo para no exponer datos ajenos
-                safeThreadId = null; 
-            }
-        }
-
-        if (!safeThreadId) {
-            const thread = await openai.beta.threads.create();
-            safeThreadId = thread.id;
-            // Guardar asociación Thread-Usuario
-            await masterSupabase.from('chat_threads').insert({
-                user_id: userId,
-                openai_thread_id: safeThreadId,
-                created_at: new Date()
-            });
-        }
-
-        // 3. Enviar mensaje a OpenAI
-        await openai.beta.threads.messages.create(safeThreadId, {
-            role: "user",
-            content: message
+        const completion = await openai.chat.completions.create({
+            model: "tngtech/deepseek-r1t2-chimera:free", 
+            messages: [
+                { 
+                    role: "system", 
+                    content: "Eres Vintex AI, un asistente experto en gestión de clínicas y negocios. Responde de forma breve, profesional y útil." 
+                },
+                { role: "user", content: message }
+            ],
+            temperature: 0.7,
+            max_tokens: 1000,
         });
 
-        const run = await openai.beta.threads.runs.create(safeThreadId, {
-            assistant_id: process.env.OPENAI_ASSISTANT_ID
-        });
+        const responseText = completion.choices[0]?.message?.content || "No pude generar una respuesta.";
 
-        // 4. Polling con Timeout y Race Condition check básico
-        let runStatus = await openai.beta.threads.runs.retrieve(safeThreadId, run.id);
-        const startTime = Date.now();
-        const TIMEOUT_MS = 25000; // 25s máx para no bloquear server (Node Event Loop)
-
-        while (runStatus.status !== "completed") {
-            if (Date.now() - startTime > TIMEOUT_MS) {
-                throw new Error("Timeout esperando respuesta de IA");
-            }
-            if (runStatus.status === 'failed' || runStatus.status === 'cancelled') {
-                 throw new Error("Error en procesamiento de IA");
-            }
-            await new Promise((resolve) => setTimeout(resolve, 1000));
-            runStatus = await openai.beta.threads.runs.retrieve(safeThreadId, run.id);
-        }
-
-        const messages = await openai.beta.threads.messages.list(safeThreadId);
-        const lastMessage = messages.data
-            .filter((msg) => msg.run_id === run.id && msg.role === "assistant")
-            .pop();
-
-        let responseText = "No se pudo generar respuesta.";
-        if (lastMessage && lastMessage.content[0].type === "text") {
-            responseText = lastMessage.content[0].text.value;
-        }
-
-        // 5. Sanity Check de Respuesta (Básico)
-        if (responseText.length > 5000 || /error|fatal/i.test(responseText)) {
-             // Loguear para revisión humana pero no enviar raw error al usuario
-             console.error("[IA Output] Posible alucinación o error largo:", responseText);
-        }
-
-        res.json({ response: responseText, threadId: safeThreadId });
+        res.json({ response: responseText });
 
     } catch (e) {
-        // 6. No exponer errores internos de OpenAI
-        console.error("Error Chat:", e.message);
+        console.error("Error Chat OpenRouter:", e);
         res.status(503).json({ error: "El servicio de IA está ocupado, intenta de nuevo." });
     }
-});
-
-// =================================================================
-// RUTAS NUEVAS: WEBHOOKS (Integridad)
-// =================================================================
-
-// Verificación GET (Meta Challenge)
-app.get('/webhook', (req, res) => {
-    const mode = req.query['hub.mode'];
-    const token = req.query['hub.verify_token'];
-    const challenge = req.query['hub.challenge'];
-
-    if (mode === 'subscribe' && token === process.env.WHATSAPP_VERIFY_TOKEN) {
-        res.status(200).send(challenge);
-    } else {
-        res.sendStatus(403);
-    }
-});
-
-// Recepción POST (Mensajes)
-app.post('/webhook', async (req, res) => {
-    // 1. Verificación de Firma Criptográfica (Integridad)
-    const signature = req.headers['x-hub-signature-256'];
-    if (!signature) {
-        console.warn("[WEBHOOK] Falta firma X-Hub-Signature");
-        return res.sendStatus(403);
-    }
-
-    if (!process.env.WHATSAPP_APP_SECRET) {
-        console.error("❌ FALTA WHATSAPP_APP_SECRET para validar webhook");
-        return res.sendStatus(500);
-    }
-
-    const elements = signature.split('=');
-    const signatureHash = elements[1];
-    // Usamos req.rawBody capturado en el middleware
-    const expectedHash = crypto
-        .createHmac('sha256', process.env.WHATSAPP_APP_SECRET)
-        .update(req.rawBody) 
-        .digest('hex');
-
-    if (signatureHash !== expectedHash) {
-        console.warn("[WEBHOOK] Firma inválida. Posible ataque.");
-        return res.sendStatus(403);
-    }
-
-    // 2. Procesamiento Seguro
-    // No loguear req.body completo para no violar GDPR/HIPAA
-    console.log("[WEBHOOK] Mensaje verificado recibido."); 
-
-    // Aquí iría tu lógica de negocio (enviar a N8N, guardar en DB, etc.)
-    // ...
-
-    res.sendStatus(200);
 });
 
 // =================================================================
@@ -462,21 +396,26 @@ app.post('/webhook', async (req, res) => {
 // =================================================================
 
 app.get('/api/config/init-session', async (req, res) => {
-    // ... (Código original se mantiene igual)
     const authHeader = req.headers.authorization;
     if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
     const token = authHeader.split(' ')[1];
     try {
         const { data: { user }, error } = await masterSupabase.auth.getUser(token);
         if (error || !user) return res.status(401).json({ error: 'Sesión inválida' });
+        
         const { data: config } = await masterSupabase
             .from('web_clinica')
             .select('SUPABASE_URL, SUPABASE_ANON_KEY')
             .eq('ID_USER', user.id)
             .single();
+            
         if (!config) return res.status(200).json({ hasClinic: false });
+        
         return res.json({
-            hasClinic: true, backendUrl: SATELLITE_URL, supabaseUrl: config.SUPABASE_URL, supabaseAnonKey: config.SUPABASE_ANON_KEY 
+            hasClinic: true, 
+            backendUrl: SATELLITE_URL, 
+            supabaseUrl: config.SUPABASE_URL, 
+            supabaseAnonKey: config.SUPABASE_ANON_KEY 
         });
     } catch (e) {
         console.error("Error Init Session:", e.message);
@@ -485,7 +424,6 @@ app.get('/api/config/init-session', async (req, res) => {
 });
 
 app.post('/api/internal/get-clinic-credentials', async (req, res) => {
-    // ... (Código original se mantiene igual)
     const internalSecret = req.headers['x-internal-secret'];
     if (!internalSecret || internalSecret !== process.env.INTERNAL_SECRET_KEY) {
         return res.status(403).json({ error: 'Forbidden' });
@@ -499,7 +437,7 @@ app.post('/api/internal/get-clinic-credentials', async (req, res) => {
             .eq('ID_USER', userId)
             .single();
         if (!config) return res.status(404).json({ error: 'Configuración no encontrada' });
-        // const serviceKey = decrypt(config.SUPABASE_SERVICE_KEY); // Descomentar cuando uses encrypt
+        
         res.json({ url: config.SUPABASE_URL, key: config.SUPABASE_SERVICE_KEY });
     } catch (e) {
         console.error("Error Internal Credentials:", e.message);
@@ -507,8 +445,7 @@ app.post('/api/internal/get-clinic-credentials', async (req, res) => {
     }
 });
 
-// Listener con Timeout para prevenir Slowloris
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 MASTER SERVER SECURED (api-master.vintex.net.br) en puerto ${PORT}`);
 });
-server.setTimeout(30000); // 30s timeout
+server.setTimeout(30000);
