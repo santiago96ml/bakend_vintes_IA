@@ -108,8 +108,8 @@ app.use(cors({
     credentials: true
 }));
 
-// 3. Body Parser
-app.use(express.json({ limit: '10kb' }));
+app.use(express.json({ limit: '50mb' })); 
+app.use(express.urlencoded({ limit: '50mb', extended: true })); // También aumentamos este por si acaso
 
 // 4. Rate Limits (Recuperado: Mensajes descriptivos)
 const limiter = rateLimit({
