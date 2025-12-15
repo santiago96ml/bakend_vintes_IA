@@ -16,7 +16,7 @@ app.set('trust proxy', 1);
 
 const PORT = process.env.PORT || 3000;
 
-// --- CONFIGURACIÓN CRIPTOGRAFÍA ---
+// --- 🔒 SEGURIDAD: CONFIGURACIÓN CRIPTOGRAFÍA (Recuperado) ---
 if (!process.env.MASTER_ENCRYPTION_KEY) {
     console.warn("⚠️ ADVERTENCIA: Falta MASTER_ENCRYPTION_KEY. Usando clave temporal insegura.");
 }
@@ -46,7 +46,7 @@ function decrypt(text) {
     return decrypted.toString();
 }
 
-// --- CONFIGURACIÓN OPENROUTER (DEEPSEEK) ---
+// --- CONFIGURACIÓN OPENROUTER (IA) ---
 let openai;
 if (process.env.OPENROUTER_API_KEY) {
     openai = new OpenAI({ 
@@ -61,10 +61,19 @@ if (process.env.OPENROUTER_API_KEY) {
     console.error("❌ FALTA OPENROUTER_API_KEY en .env");
 }
 
-// --- DOMINIOS PERMITIDOS ---
+// --- 🔒 SEGURIDAD: DOMINIOS PERMITIDOS (CORS ESTRICTO) ---
 const SATELLITE_URL = process.env.SATELLITE_URL || "https://api-clinica.vintex.net.br";
 const FRONTEND_URL = process.env.FRONTEND_URL || "https://vintex.net.br";
-const ALLOWED_ORIGINS = [FRONTEND_URL, 'https://vintex.net.br', 'http://localhost:5173', 'http://localhost:3000'];
+// Añadimos tu dominio de Hostinger a la lista blanca para que no falle
+const HOSTINGER_URL = "https://webs-de-vintex-login-web.1kh9sk.easypanel.host";
+
+const ALLOWED_ORIGINS = [
+    FRONTEND_URL, 
+    HOSTINGER_URL,
+    'https://vintex.net.br', 
+    'http://localhost:5173', // Desarrollo Local
+    'http://localhost:3000'
+];
 
 // --- MIDDLEWARES SEGURIDAD ---
 
@@ -84,29 +93,29 @@ app.use(helmet({
   }
 }));
 
-// 2. CORS (Limpiamos cabeceras de WhatsApp)
+// 2. CORS (Recuperado: Modo Estricto)
 app.use(cors({
     origin: (origin, callback) => {
         if (!origin || ALLOWED_ORIGINS.includes(origin)) {
             callback(null, true);
         } else {
-            console.warn(`Bloqueo CORS para origen: ${origin}`);
-            callback(new Error('Bloqueado por CORS'));
+            console.warn(`[CORS SECURITY] Bloqueo para origen no autorizado: ${origin}`);
+            callback(new Error('Bloqueado por CORS')); // Bloqueo real
         }
     },
     methods: ['GET', 'POST', 'PATCH', 'DELETE'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'x-internal-secret'], // Quitamos x-hub-signature-256
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-internal-secret'], 
     credentials: true
 }));
 
-// 3. Body Parser (Simplificado, ya no necesitamos rawBody)
+// 3. Body Parser
 app.use(express.json({ limit: '10kb' }));
 
-// 4. Rate Limits
+// 4. Rate Limits (Recuperado: Mensajes descriptivos)
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     limit: 300, 
-    message: { error: "Demasiadas peticiones." },
+    message: { error: "Demasiadas peticiones. Intenta más tarde." },
     standardHeaders: true,
     legacyHeaders: false,
 });
@@ -115,18 +124,18 @@ app.use(limiter);
 const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     limit: 50, 
-    message: { error: "Demasiados intentos de autenticación." }
+    message: { error: "Demasiados intentos de autenticación. Seguridad activada." }
 });
 
 const chatLimiter = rateLimit({
     windowMs: 3 * 60 * 60 * 1000, 
     limit: 100, 
-    message: { error: "Límite de chat excedido." },
+    message: { error: "Límite de chat excedido por seguridad." },
     standardHeaders: true,
     legacyHeaders: false,
 });
 
-// 5. Logger Sanitizado
+// 5. Logger Sanitizado (Recuperado: Protección de Datos)
 const sanitizeLog = (obj) => {
     if (!obj) return obj;
     const copy = { ...obj };
@@ -168,7 +177,6 @@ const registerSchema = z.object({
     full_name: z.string().min(2)
 });
 
-// ✅ RECUPERADO: Schema para Trial
 const trialSchema = z.object({
     email: z.string().email(),
     fullName: z.string().min(2),
@@ -185,10 +193,16 @@ const chatSchema = z.object({
     threadId: z.string().optional() 
 });
 
-const onboardingSchema = z.object({
-    companyName: z.string().min(2, "Nombre de empresa muy corto"),
-    description: z.string().min(10, "Describe mejor tu empresa para la IA"),
-    requirements: z.string().optional()
+const onboardingChatSchema = z.object({
+    messages: z.array(z.object({
+        role: z.enum(['user', 'assistant', 'system']),
+        content: z.string()
+    }))
+});
+
+const onboardingCompleteSchema = z.object({
+    conversationSummary: z.string().min(10),
+    schemaConfig: z.any().optional()
 });
 
 const validate = (schema) => (req, res, next) => {
@@ -216,19 +230,27 @@ const requireAuth = async (req, res, next) => {
     }
 };
 
-// --- ANTI PROMPT INJECTION ---
+// --- 🔒 SEGURIDAD: ANTI PROMPT INJECTION (Recuperado) ---
 const detectPromptInjection = (text) => {
     const patterns = [
         /ignore previous instructions/i, /ignora tus instrucciones/i,
-        /system prompt/i, /act as a/i, /actúa como/i, /reset instructions/i
+        /system prompt/i, /act as a/i, /actúa como/i, /reset instructions/i,
+        /eres un bot/i, /your core directive/i
     ];
-    return patterns.some(pattern => pattern.test(text));
+    // Verifica si es un string simple o un array de mensajes
+    if (typeof text === 'string') {
+        return patterns.some(pattern => pattern.test(text));
+    } else if (Array.isArray(text)) {
+        return text.some(msg => patterns.some(pattern => pattern.test(msg.content || "")));
+    }
+    return false;
 };
 
 // =================================================================
 // RUTAS DE NEGOCIO
 // =================================================================
 
+// 1. REGISTRO (Protegido con authLimiter)
 app.post('/api/register', authLimiter, validate(registerSchema), async (req, res) => {
   const { email, password, full_name } = req.body;
   try {
@@ -245,8 +267,11 @@ app.post('/api/register', authLimiter, validate(registerSchema), async (req, res
     
     if (userError) console.error("Error insertando user profile:", userError);
 
+    // NUEVA LÓGICA: Activamos flags para el Onboarding
     await masterSupabase.from('servisi').insert({
-        "ID_User": userId, web_clinica: false, "Bot_clinica": false
+        "ID_User": userId, 
+        web_clinica: true, 
+        "Bot_clinica": true 
     });
 
     res.status(200).json({
@@ -260,7 +285,7 @@ app.post('/api/register', authLimiter, validate(registerSchema), async (req, res
   }
 });
 
-// ✅ RECUPERADA: Ruta para Start Trial
+// 2. START TRIAL (Protegido con authLimiter)
 app.post('/api/start-trial', authLimiter, validate(trialSchema), async (req, res) => {
     const { email, fullName, phone } = req.body;
     const tempPassword = crypto.randomBytes(16).toString('hex') + "V!1";
@@ -273,8 +298,9 @@ app.post('/api/start-trial', authLimiter, validate(trialSchema), async (req, res
         await masterSupabase.from('users').insert({
             id: userId, email, full_name, phone, role: 'admin'
         });
-        await masterSupabase.from('servisi').insert({
-            "ID_User": userId, web_clinica: false, "Bot_clinica": false
+        // Coherencia: Activamos servisi también aquí
+        await masterSupabase.from('servisi').insert({ 
+            "ID_User": userId, web_clinica: true, "Bot_clinica": true 
         });
         console.log(`[INFO] Usuario Trial creado: ${email}`); 
         return res.status(201).json({ success: true, message: 'Usuario registrado. Revisa tu email.' });
@@ -284,6 +310,7 @@ app.post('/api/start-trial', authLimiter, validate(trialSchema), async (req, res
     }
 });
 
+// 3. LOGIN (Recuperado: authLimiter activado)
 app.post('/api/login', authLimiter, validate(loginSchema), async (req, res) => {
     const { email, password } = req.body;
     try {
@@ -302,12 +329,48 @@ app.post('/api/login', authLimiter, validate(loginSchema), async (req, res) => {
     }
 });
 
-// =================================================================
-// RUTA DE AUTOMATIZACIÓN (Onboarding + n8n)
-// =================================================================
+// 4. CHAT ARQUITECTO (Onboarding - Protegido contra Injection)
+app.post('/api/onboarding/chat', requireAuth, validate(onboardingChatSchema), async (req, res) => {
+    const { messages } = req.body;
+    const userId = req.user.id;
 
-app.post('/api/onboarding/complete', requireAuth, validate(onboardingSchema), async (req, res) => {
-    const { companyName, description } = req.body;
+    // 🛡️ SEGURIDAD: Detección de Prompt Injection
+    if (detectPromptInjection(messages)) {
+        console.warn(`[SECURITY] Prompt Injection detectado en Onboarding. User: ${userId}`);
+        return res.status(400).json({ error: "Entrada no permitida por políticas de seguridad." });
+    }
+    
+    const systemPrompt = `Eres "Vintex Architect", un ingeniero de software experto en diseño de bases de datos PostgreSQL para SaaS.
+    TU OBJETIVO: Entrevistar al nuevo usuario para entender su negocio y diseñar su esquema de base de datos a medida.
+    REGLAS DE INTERACCIÓN:
+    1. Haz UNA sola pregunta a la vez. Sé conciso y profesional.
+    2. Primero: Pregunta el nombre del negocio y su rubro principal.
+    3. Segundo: Profundiza en sus entidades clave.
+    4. Razona sobre las relaciones (1:N, N:M).
+    5. Cuando tengas suficiente info, ofrece un resumen y di que estás listo para construir.
+    IMPORTANTE: Tu output servirá para generar el código SQL final.`;
+
+    try {
+        const completion = await openai.chat.completions.create({
+            model: "nvidia/nemotron-3-nano-30b-a3b:free", 
+            messages: [
+                { role: "system", content: systemPrompt },
+                ...messages
+            ],
+            temperature: 0.5,
+            max_tokens: 600,
+        });
+
+        res.json({ response: completion.choices[0]?.message?.content });
+    } catch (e) {
+        console.error("Error Arquitecto:", e);
+        res.status(503).json({ error: "El arquitecto está pensando... reintenta." });
+    }
+});
+
+// 5. COMPLETAR ONBOARDING (Gatillo n8n)
+app.post('/api/onboarding/complete', requireAuth, validate(onboardingCompleteSchema), async (req, res) => {
+    const { conversationSummary, schemaConfig } = req.body;
     const user = req.user;
     const N8N_URL = process.env.N8N_DEPLOY_WEBHOOK_URL; 
 
@@ -330,9 +393,9 @@ app.post('/api/onboarding/complete', requireAuth, validate(onboardingSchema), as
         const payload = {
             userId: user.id,
             email: user.email,
-            companyName: companyName,
-            description: description,
-            source: "web_onboarding"
+            companyName: schemaConfig?.appName || "Mi Negocio",
+            description: conversationSummary, // La IA de n8n usará este resumen
+            source: "chat_onboarding_architect"
         };
 
         fetch(N8N_URL, {
@@ -346,6 +409,15 @@ app.post('/api/onboarding/complete', requireAuth, validate(onboardingSchema), as
         })
         .catch(err => console.error("🔥 Error contactando a n8n:", err.message));
 
+        // Crear registro placeholder seguro
+        const { error: dbError } = await masterSupabase
+            .from('web_clinica')
+            .upsert({ 
+                "ID_USER": user.id,
+            }, { onConflict: "ID_USER" });
+
+        if (dbError) throw dbError;
+
         res.json({ success: true, message: "Despliegue iniciado." });
 
     } catch (error) {
@@ -354,10 +426,7 @@ app.post('/api/onboarding/complete', requireAuth, validate(onboardingSchema), as
     }
 });
 
-// =================================================================
-// 🧠 RUTA CHAT IA (OpenRouter / DeepSeek)
-// =================================================================
-
+// 6. CHAT GENERAL (Protegido contra Injection)
 app.post('/chat', requireAuth, chatLimiter, validate(chatSchema), async (req, res) => {
     const { message } = req.body; 
     const userId = req.user.id;
@@ -373,7 +442,7 @@ app.post('/chat', requireAuth, chatLimiter, validate(chatSchema), async (req, re
             messages: [
                 { 
                     role: "system", 
-                    content: "Eres Vintex AI, un asistente experto en gestión de clínicas y negocios. Responde de forma breve, profesional y útil." 
+                    content: "Eres Vintex AI, un asistente experto en gestión de clínicas y negocios." 
                 },
                 { role: "user", content: message }
             ],
@@ -382,7 +451,6 @@ app.post('/chat', requireAuth, chatLimiter, validate(chatSchema), async (req, re
         });
 
         const responseText = completion.choices[0]?.message?.content || "No pude generar una respuesta.";
-
         res.json({ response: responseText });
 
     } catch (e) {
