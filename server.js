@@ -16,7 +16,7 @@ app.set('trust proxy', 1);
 
 const PORT = process.env.PORT || 3000;
 
-// --- 🔒 SEGURIDAD: CONFIGURACIÓN CRIPTOGRAFÍA (Recuperado) ---
+// --- 🔒 SEGURIDAD: CONFIGURACIÓN CRIPTOGRAFÍA ---
 if (!process.env.MASTER_ENCRYPTION_KEY) {
     console.warn("⚠️ ADVERTENCIA: Falta MASTER_ENCRYPTION_KEY. Usando clave temporal insegura.");
 }
@@ -64,20 +64,18 @@ if (process.env.OPENROUTER_API_KEY) {
 // --- 🔒 SEGURIDAD: DOMINIOS PERMITIDOS (CORS ESTRICTO) ---
 const SATELLITE_URL = process.env.SATELLITE_URL || "https://api-clinica.vintex.net.br";
 const FRONTEND_URL = process.env.FRONTEND_URL || "https://vintex.net.br";
-// Añadimos tu dominio de Hostinger a la lista blanca para que no falle
 const HOSTINGER_URL = "https://webs-de-vintex-login-web.1kh9sk.easypanel.host";
 
 const ALLOWED_ORIGINS = [
     FRONTEND_URL, 
     HOSTINGER_URL,
     'https://vintex.net.br', 
-    'http://localhost:5173', // Desarrollo Local
+    'http://localhost:5173', 
     'http://localhost:3000'
 ];
 
 // --- MIDDLEWARES SEGURIDAD ---
 
-// 1. Helmet
 app.use(helmet({
   contentSecurityPolicy: {
     directives: {
@@ -93,14 +91,13 @@ app.use(helmet({
   }
 }));
 
-// 2. CORS (Recuperado: Modo Estricto)
 app.use(cors({
     origin: (origin, callback) => {
         if (!origin || ALLOWED_ORIGINS.includes(origin)) {
             callback(null, true);
         } else {
             console.warn(`[CORS SECURITY] Bloqueo para origen no autorizado: ${origin}`);
-            callback(new Error('Bloqueado por CORS')); // Bloqueo real
+            callback(new Error('Bloqueado por CORS')); 
         }
     },
     methods: ['GET', 'POST', 'PATCH', 'DELETE'],
@@ -108,10 +105,11 @@ app.use(cors({
     credentials: true
 }));
 
+// 🔴 LÍMITE AUMENTADO PARA CHAT LARGO
 app.use(express.json({ limit: '50mb' })); 
-app.use(express.urlencoded({ limit: '50mb', extended: true })); // También aumentamos este por si acaso
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// 4. Rate Limits (Recuperado: Mensajes descriptivos)
+// 4. Rate Limits
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     limit: 300, 
@@ -135,7 +133,7 @@ const chatLimiter = rateLimit({
     legacyHeaders: false,
 });
 
-// 5. Logger Sanitizado (Recuperado: Protección de Datos)
+// 5. Logger Sanitizado
 const sanitizeLog = (obj) => {
     if (!obj) return obj;
     const copy = { ...obj };
@@ -230,14 +228,13 @@ const requireAuth = async (req, res, next) => {
     }
 };
 
-// --- 🔒 SEGURIDAD: ANTI PROMPT INJECTION (Recuperado) ---
+// --- 🔒 SEGURIDAD: ANTI PROMPT INJECTION ---
 const detectPromptInjection = (text) => {
     const patterns = [
         /ignore previous instructions/i, /ignora tus instrucciones/i,
         /system prompt/i, /act as a/i, /actúa como/i, /reset instructions/i,
         /eres un bot/i, /your core directive/i
     ];
-    // Verifica si es un string simple o un array de mensajes
     if (typeof text === 'string') {
         return patterns.some(pattern => pattern.test(text));
     } else if (Array.isArray(text)) {
@@ -250,7 +247,7 @@ const detectPromptInjection = (text) => {
 // RUTAS DE NEGOCIO
 // =================================================================
 
-// 1. REGISTRO (Protegido con authLimiter)
+// 1. REGISTRO
 app.post('/api/register', authLimiter, validate(registerSchema), async (req, res) => {
   const { email, password, full_name } = req.body;
   try {
@@ -267,7 +264,6 @@ app.post('/api/register', authLimiter, validate(registerSchema), async (req, res
     
     if (userError) console.error("Error insertando user profile:", userError);
 
-    // NUEVA LÓGICA: Activamos flags para el Onboarding
     await masterSupabase.from('servisi').insert({
         "ID_User": userId, 
         web_clinica: true, 
@@ -285,7 +281,7 @@ app.post('/api/register', authLimiter, validate(registerSchema), async (req, res
   }
 });
 
-// 2. START TRIAL (Protegido con authLimiter)
+// 2. START TRIAL
 app.post('/api/start-trial', authLimiter, validate(trialSchema), async (req, res) => {
     const { email, fullName, phone } = req.body;
     const tempPassword = crypto.randomBytes(16).toString('hex') + "V!1";
@@ -298,7 +294,6 @@ app.post('/api/start-trial', authLimiter, validate(trialSchema), async (req, res
         await masterSupabase.from('users').insert({
             id: userId, email, full_name, phone, role: 'admin'
         });
-        // Coherencia: Activamos servisi también aquí
         await masterSupabase.from('servisi').insert({ 
             "ID_User": userId, web_clinica: true, "Bot_clinica": true 
         });
@@ -310,7 +305,7 @@ app.post('/api/start-trial', authLimiter, validate(trialSchema), async (req, res
     }
 });
 
-// 3. LOGIN (Recuperado: authLimiter activado)
+// 3. LOGIN
 app.post('/api/login', authLimiter, validate(loginSchema), async (req, res) => {
     const { email, password } = req.body;
     try {
@@ -329,12 +324,11 @@ app.post('/api/login', authLimiter, validate(loginSchema), async (req, res) => {
     }
 });
 
-// 4. CHAT ARQUITECTO (Onboarding - Protegido contra Injection)
+// 4. CHAT ARQUITECTO
 app.post('/api/onboarding/chat', requireAuth, validate(onboardingChatSchema), async (req, res) => {
     const { messages } = req.body;
     const userId = req.user.id;
 
-    // 🛡️ SEGURIDAD: Detección de Prompt Injection
     if (detectPromptInjection(messages)) {
         console.warn(`[SECURITY] Prompt Injection detectado en Onboarding. User: ${userId}`);
         return res.status(400).json({ error: "Entrada no permitida por políticas de seguridad." });
@@ -368,7 +362,7 @@ app.post('/api/onboarding/chat', requireAuth, validate(onboardingChatSchema), as
     }
 });
 
-// 5. COMPLETAR ONBOARDING (Gatillo n8n)
+// 5. COMPLETAR ONBOARDING (CORREGIDO: Placeholders para evitar error 500)
 app.post('/api/onboarding/complete', requireAuth, validate(onboardingCompleteSchema), async (req, res) => {
     const { conversationSummary, schemaConfig } = req.body;
     const user = req.user;
@@ -394,7 +388,7 @@ app.post('/api/onboarding/complete', requireAuth, validate(onboardingCompleteSch
             userId: user.id,
             email: user.email,
             companyName: schemaConfig?.appName || "Mi Negocio",
-            description: conversationSummary, // La IA de n8n usará este resumen
+            description: conversationSummary, 
             source: "chat_onboarding_architect"
         };
 
@@ -409,11 +403,18 @@ app.post('/api/onboarding/complete', requireAuth, validate(onboardingCompleteSch
         })
         .catch(err => console.error("🔥 Error contactando a n8n:", err.message));
 
-        // Crear registro placeholder seguro
+        // 🔴 CORRECCIÓN CRÍTICA AQUÍ:
+        // Agregamos valores temporales "pending" para satisfacer los Constraints NOT NULL de la BD.
+        // n8n sobrescribirá estos valores con los reales (UPDATE) unos segundos/minutos después.
         const { error: dbError } = await masterSupabase
             .from('web_clinica')
             .upsert({ 
                 "ID_USER": user.id,
+                "SUPABASE_URL": "https://building.vintex.ai", // Placeholder
+                "SUPABASE_ANON_KEY": "building_pending_key",  // Placeholder
+                "SUPABASE_SERVICE_KEY": "building_pending_key", // Placeholder
+                "JWT_SECRET": "building_secret",              // Placeholder
+                "url_backend": "https://building.vintex.ai"   // Placeholder
             }, { onConflict: "ID_USER" });
 
         if (dbError) throw dbError;
@@ -426,7 +427,7 @@ app.post('/api/onboarding/complete', requireAuth, validate(onboardingCompleteSch
     }
 });
 
-// 6. CHAT GENERAL (Protegido contra Injection)
+// 6. CHAT GENERAL
 app.post('/chat', requireAuth, chatLimiter, validate(chatSchema), async (req, res) => {
     const { message } = req.body; 
     const userId = req.user.id;
@@ -459,10 +460,7 @@ app.post('/chat', requireAuth, chatLimiter, validate(chatSchema), async (req, re
     }
 });
 
-// =================================================================
 // RUTAS INFRAESTRUCTURA
-// =================================================================
-
 app.get('/api/config/init-session', async (req, res) => {
     const authHeader = req.headers.authorization;
     if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
