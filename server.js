@@ -64,7 +64,6 @@ if (process.env.OPENROUTER_API_KEY) {
 // --- 🔒 SEGURIDAD: DOMINIOS PERMITIDOS (CORS ESTRICTO) ---
 const SATELLITE_URL = process.env.SATELLITE_URL || "https://api-clinica.vintex.net.br";
 const FRONTEND_URL = process.env.FRONTEND_URL || "https://vintex.net.br";
-// Añadimos tu dominio de Hostinger a la lista blanca para que no falle
 const HOSTINGER_URL = "https://webs-de-vintex-login-web.1kh9sk.easypanel.host";
 
 const ALLOWED_ORIGINS = [
@@ -136,7 +135,7 @@ const chatLimiter = rateLimit({
     legacyHeaders: false,
 });
 
-// 5. Logger Sanitizado (Protección de Datos en Logs)
+// 5. Logger Sanitizado
 const sanitizeLog = (obj) => {
     if (!obj) return obj;
     const copy = { ...obj };
@@ -261,14 +260,12 @@ app.post('/api/register', authLimiter, validate(registerSchema), async (req, res
     if (!authData.user) throw new Error("Error en creación de usuario.");
     const userId = authData.user.id;
 
-    // Crear perfil en tabla users
     const { error: userError } = await masterSupabase.from('users').insert({
         id: userId, email, full_name, role: 'admin', created_at: new Date()
     });
     
     if (userError) console.error("Error insertando user profile:", userError);
 
-    // Habilitar onboarding en servisi
     await masterSupabase.from('servisi').insert({
         "ID_User": userId, 
         web_clinica: true, 
@@ -339,15 +336,46 @@ app.post('/api/onboarding/chat', requireAuth, validate(onboardingChatSchema), as
         return res.status(400).json({ error: "Entrada no permitida por políticas de seguridad." });
     }
     
-    const systemPrompt = `Eres "Vintex Architect", un ingeniero de software experto en diseño de bases de datos PostgreSQL para SaaS.
-    TU OBJETIVO: Entrevistar al nuevo usuario para entender su negocio y diseñar su esquema de base de datos a medida.
-    REGLAS DE INTERACCIÓN:
-    1. Haz UNA sola pregunta a la vez. Sé conciso y profesional.
-    2. Primero: Pregunta el nombre del negocio y su rubro principal.
-    3. Segundo: Profundiza en sus entidades clave.
-    4. Razona sobre las relaciones (1:N, N:M).
-    5. Cuando tengas suficiente info, ofrece un resumen y di que estás listo para construir.
-    IMPORTANTE: Tu output servirá para generar el código SQL final.`;
+    const systemPrompt = `Eres "Vintex Architect", un Consultor de Producto experto en diseñar aplicaciones de gestión estilo Airtable/No-Code.
+TU OBJETIVO: Entrevistar al usuario para definir su modelo de negocio y, CRÍTICAMENTE, cómo quiere VISUALIZAR sus datos.
+
+REGLAS DE INTERACCIÓN:
+1.  Haz UNA sola pregunta a la vez.
+2.  Mantén un tono profesional pero cercano.
+3.  Tu objetivo final es generar un "RESUMEN TÉCNICO" que servirá de input para un sistema automático.
+
+FASES DE LA ENTREVISTA:
+
+FASE 1: EL NEGOCIO
+- Pregunta: "¡Hola! Vamos a construir tu app. Primero, ¿cuál es el nombre de tu proyecto y a qué se dedica principalmente?"
+- Objetivo: Identificar el rubro (Clínica, Taller, Tienda, etc.).
+
+FASE 2: LOS DATOS (ENTIDADES)
+- Basado en el rubro, sugiere las entidades principales.
+- Pregunta: "Para gestionar [Negocio], necesitaremos registrar cosas. Por ejemplo: Clientes, Pedidos, Inventario. ¿Cuáles son las 3 cosas más importantes que necesitas controlar?"
+
+FASE 3: VISTAS Y EXPERIENCIA (CRÍTICO PARA UI)
+- Aquí debes definir el diseño.
+- PREGUNTA OBLIGATORIA: "Hablemos de cómo quieres trabajar. Para tus datos principales (como [Entidad mencionada]), ¿te gustaría verlos en un CALENDARIO (para fechas), en un TABLERO KANBAN (para mover tarjetas por etapas como 'Pendiente' -> 'Listo'), o prefieres una lista simple?"
+- Si eligen Kanban: Pregunta "¿Qué estados debería tener? (Ej: Pendiente, En Proceso, Finalizado)".
+- Si eligen Calendario: Confirma qué fecha es la importante (Ej: Fecha de Cita, Fecha de Entrega).
+
+FASE 4: CAMPOS ESPECIALES
+- Pregunta: "¿Necesitas guardar archivos adjuntos (fotos/PDFs) o cobrar a través de la app?"
+
+CIERRE Y GENERACIÓN:
+- Cuando tengas todo claro, di: "Perfecto, tengo la estructura lista. Procedo a generar tu configuración."
+- IMPORTANTE: Tu último mensaje DEBE incluir un bloque llamado "MEMORIA TÉCNICA" con este formato exacto (para que la IA de backend lo lea):
+
+--- MEMORIA TÉCNICA ---
+NEGOCIO: [Nombre]
+RUBRO: [Rubro]
+TABLAS PRINCIPALES: [Lista de tablas]
+VISTA PREFERIDA: [CALENDARIO / KANBAN / LISTA / GALERÍA]
+ESTADOS KANBAN: [Lista de estados o N/A]
+FUNCIONALIDADES EXTRA: [Pagos, Archivos, etc.]
+RESUMEN: [Breve descripción de 2 líneas del flujo completo]
+-----------------------`;
 
     try {
         const completion = await openai.chat.completions.create({
@@ -367,20 +395,48 @@ app.post('/api/onboarding/chat', requireAuth, validate(onboardingChatSchema), as
     }
 });
 
-// 5. COMPLETAR ONBOARDING (Placeholders + Trigger n8n)
+// 5. COMPLETAR ONBOARDING (MODIFICADO: CON FALLBACK DE USUARIO)
 app.post('/api/onboarding/complete', requireAuth, validate(onboardingCompleteSchema), async (req, res) => {
     const { conversationSummary, schemaConfig } = req.body;
     const user = req.user;
     const N8N_URL = process.env.N8N_DEPLOY_WEBHOOK_URL; 
 
     if (!N8N_URL) {
-        console.error("❌ ERROR CRÍTICO: Faltan N8N_DEPLOY_WEBHOOK_URL en .env");
         return res.status(500).json({ error: "Error de configuración del sistema." });
     }
 
     try {
         console.log(`🚀 [AUTOMATION] Iniciando despliegue para Usuario: ${user.id}`);
 
+        // --- 🛡️ PASO DE SEGURIDAD: VERIFICAR/CREAR USUARIO ---
+        // Verificamos si el usuario ya tiene perfil en la tabla 'users'
+        const { data: existingUser } = await masterSupabase
+            .from('users')
+            .select('id')
+            .eq('id', user.id)
+            .single();
+
+        if (!existingUser) {
+            console.log(`⚠️ Usuario ${user.id} no encontrado en tabla pública. Creándolo ahora...`);
+            
+            // Lo creamos manualmente usando los datos del Token (Google)
+            const { error: insertError } = await masterSupabase.from('users').insert({
+                id: user.id,
+                email: user.email,
+                // Intentamos sacar el nombre de los metadatos de Google, o usamos el email
+                full_name: user.user_metadata?.full_name || user.email.split('@')[0],
+                role: 'admin',
+                created_at: new Date()
+            });
+
+            if (insertError) {
+                console.error("❌ Error creando usuario fallback:", insertError);
+                throw new Error("No se pudo crear el perfil del usuario.");
+            }
+        }
+        // -----------------------------------------------------
+
+        // Ahora sí, actualizamos el estado (Ya es seguro porque el usuario existe)
         const { error: updateError } = await masterSupabase.from('users').update({ 
             subscription_status: 'active',
             plan_type: 'pro',
@@ -389,6 +445,7 @@ app.post('/api/onboarding/complete', requireAuth, validate(onboardingCompleteSch
 
         if (updateError) console.warn("Advertencia al actualizar usuario:", updateError.message);
 
+        // Disparamos n8n
         const payload = {
             userId: user.id,
             email: user.email,
@@ -397,28 +454,23 @@ app.post('/api/onboarding/complete', requireAuth, validate(onboardingCompleteSch
             source: "chat_onboarding_architect"
         };
 
-        // Disparo n8n (Fuego y olvido)
         fetch(N8N_URL, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
-        })
-        .then(response => {
-            if (!response.ok) console.error(`⚠️ n8n respondió con error: ${response.status}`);
-            else console.log("✅ Webhook n8n entregado correctamente.");
-        })
-        .catch(err => console.error("🔥 Error contactando a n8n:", err.message));
+        }).catch(err => console.error("🔥 Error contactando a n8n:", err.message));
 
-        // PLACEHOLDERS para evitar errores de restricción NOT NULL en DB
+        // Placeholders DB
         const { error: dbError } = await masterSupabase
             .from('web_clinica')
             .upsert({ 
                 "ID_USER": user.id,
-                "SUPABASE_URL": "https://building.vintex.ai", // Placeholder
-                "SUPABASE_ANON_KEY": "building_pending_key",  // Placeholder
-                "SUPABASE_SERVICE_KEY": "building_pending_key", // Placeholder
-                "JWT_SECRET": "building_secret",              // Placeholder
-                "url_backend": "https://building.vintex.ai"   // Placeholder
+                "SUPABASE_URL": "https://building.vintex.ai",
+                "SUPABASE_ANON_KEY": "building",
+                "SUPABASE_SERVICE_KEY": "building",
+                "JWT_SECRET": "building",
+                "url_backend": "https://building.vintex.ai",
+                "status": "building" // Marcamos que se está construyendo
             }, { onConflict: "ID_USER" });
 
         if (dbError) throw dbError;
@@ -492,7 +544,7 @@ app.get('/api/config/init-session', async (req, res) => {
             backendUrl: SATELLITE_URL, 
             supabaseUrl: config.SUPABASE_URL, 
             supabaseAnonKey: config.SUPABASE_ANON_KEY,
-            uiConfig: config.ui_config // <--- ¡Aquí va el diseño personalizado!
+            uiConfig: config.ui_config 
         });
     } catch (e) {
         console.error("Error Init Session:", e.message);
