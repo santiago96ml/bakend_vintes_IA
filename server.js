@@ -11,7 +11,7 @@ import OpenAI from 'openai';
 dotenv.config();
 const app = express();
 
-// 1. TRUST PROXY
+// 1. TRUST PROXY (Importante para Rate Limits tras proxys como Easypanel/Cloudflare)
 app.set('trust proxy', 1); 
 
 const PORT = process.env.PORT || 3000;
@@ -64,18 +64,20 @@ if (process.env.OPENROUTER_API_KEY) {
 // --- 🔒 SEGURIDAD: DOMINIOS PERMITIDOS (CORS ESTRICTO) ---
 const SATELLITE_URL = process.env.SATELLITE_URL || "https://api-clinica.vintex.net.br";
 const FRONTEND_URL = process.env.FRONTEND_URL || "https://vintex.net.br";
+// Añadimos tu dominio de Hostinger a la lista blanca para que no falle
 const HOSTINGER_URL = "https://webs-de-vintex-login-web.1kh9sk.easypanel.host";
 
 const ALLOWED_ORIGINS = [
     FRONTEND_URL, 
     HOSTINGER_URL,
     'https://vintex.net.br', 
-    'http://localhost:5173', 
+    'http://localhost:5173', // Desarrollo Local
     'http://localhost:3000'
 ];
 
 // --- MIDDLEWARES SEGURIDAD ---
 
+// 1. Helmet (Cabeceras HTTP seguras)
 app.use(helmet({
   contentSecurityPolicy: {
     directives: {
@@ -91,6 +93,7 @@ app.use(helmet({
   }
 }));
 
+// 2. CORS (Modo Estricto)
 app.use(cors({
     origin: (origin, callback) => {
         if (!origin || ALLOWED_ORIGINS.includes(origin)) {
@@ -105,11 +108,11 @@ app.use(cors({
     credentials: true
 }));
 
-// 🔴 LÍMITE AUMENTADO PARA CHAT LARGO
+// 3. Body Parser (LÍMITE AUMENTADO PARA CHAT LARGO)
 app.use(express.json({ limit: '50mb' })); 
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// 4. Rate Limits
+// 4. Rate Limits (Protección contra DDOS y Fuerza Bruta)
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     limit: 300, 
@@ -133,7 +136,7 @@ const chatLimiter = rateLimit({
     legacyHeaders: false,
 });
 
-// 5. Logger Sanitizado
+// 5. Logger Sanitizado (Protección de Datos en Logs)
 const sanitizeLog = (obj) => {
     if (!obj) return obj;
     const copy = { ...obj };
@@ -168,7 +171,7 @@ const masterSupabase = createClient(
   { auth: { autoRefreshToken: false, persistSession: false } }
 );
 
-// --- SCHEMAS ZOD ---
+// --- SCHEMAS ZOD (Validación de Datos) ---
 const registerSchema = z.object({
     email: z.string().email(),
     password: z.string().min(8, "Contraseña insegura"),
@@ -258,12 +261,14 @@ app.post('/api/register', authLimiter, validate(registerSchema), async (req, res
     if (!authData.user) throw new Error("Error en creación de usuario.");
     const userId = authData.user.id;
 
+    // Crear perfil en tabla users
     const { error: userError } = await masterSupabase.from('users').insert({
         id: userId, email, full_name, role: 'admin', created_at: new Date()
     });
     
     if (userError) console.error("Error insertando user profile:", userError);
 
+    // Habilitar onboarding en servisi
     await masterSupabase.from('servisi').insert({
         "ID_User": userId, 
         web_clinica: true, 
@@ -324,7 +329,7 @@ app.post('/api/login', authLimiter, validate(loginSchema), async (req, res) => {
     }
 });
 
-// 4. CHAT ARQUITECTO
+// 4. CHAT ARQUITECTO (Onboarding)
 app.post('/api/onboarding/chat', requireAuth, validate(onboardingChatSchema), async (req, res) => {
     const { messages } = req.body;
     const userId = req.user.id;
@@ -362,7 +367,7 @@ app.post('/api/onboarding/chat', requireAuth, validate(onboardingChatSchema), as
     }
 });
 
-// 5. COMPLETAR ONBOARDING (CORREGIDO: Placeholders para evitar error 500)
+// 5. COMPLETAR ONBOARDING (Placeholders + Trigger n8n)
 app.post('/api/onboarding/complete', requireAuth, validate(onboardingCompleteSchema), async (req, res) => {
     const { conversationSummary, schemaConfig } = req.body;
     const user = req.user;
@@ -392,6 +397,7 @@ app.post('/api/onboarding/complete', requireAuth, validate(onboardingCompleteSch
             source: "chat_onboarding_architect"
         };
 
+        // Disparo n8n (Fuego y olvido)
         fetch(N8N_URL, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -403,9 +409,7 @@ app.post('/api/onboarding/complete', requireAuth, validate(onboardingCompleteSch
         })
         .catch(err => console.error("🔥 Error contactando a n8n:", err.message));
 
-        // 🔴 CORRECCIÓN CRÍTICA AQUÍ:
-        // Agregamos valores temporales "pending" para satisfacer los Constraints NOT NULL de la BD.
-        // n8n sobrescribirá estos valores con los reales (UPDATE) unos segundos/minutos después.
+        // PLACEHOLDERS para evitar errores de restricción NOT NULL en DB
         const { error: dbError } = await masterSupabase
             .from('web_clinica')
             .upsert({ 
@@ -460,18 +464,24 @@ app.post('/chat', requireAuth, chatLimiter, validate(chatSchema), async (req, re
     }
 });
 
-// RUTAS INFRAESTRUCTURA
+// =================================================================
+// RUTAS INFRAESTRUCTURA (Configuración Dinámica)
+// =================================================================
+
 app.get('/api/config/init-session', async (req, res) => {
     const authHeader = req.headers.authorization;
     if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
     const token = authHeader.split(' ')[1];
+    
     try {
         const { data: { user }, error } = await masterSupabase.auth.getUser(token);
         if (error || !user) return res.status(401).json({ error: 'Sesión inválida' });
         
+        // --- MODIFICACIÓN CLAVE PARA SERVER-DRIVEN UI ---
+        // Ahora seleccionamos también 'ui_config'
         const { data: config } = await masterSupabase
             .from('web_clinica')
-            .select('SUPABASE_URL, SUPABASE_ANON_KEY')
+            .select('SUPABASE_URL, SUPABASE_ANON_KEY, ui_config')
             .eq('ID_USER', user.id)
             .single();
             
@@ -481,7 +491,8 @@ app.get('/api/config/init-session', async (req, res) => {
             hasClinic: true, 
             backendUrl: SATELLITE_URL, 
             supabaseUrl: config.SUPABASE_URL, 
-            supabaseAnonKey: config.SUPABASE_ANON_KEY 
+            supabaseAnonKey: config.SUPABASE_ANON_KEY,
+            uiConfig: config.ui_config // <--- ¡Aquí va el diseño personalizado!
         });
     } catch (e) {
         console.error("Error Init Session:", e.message);
@@ -489,6 +500,7 @@ app.get('/api/config/init-session', async (req, res) => {
     }
 });
 
+// Ruta interna para n8n u otros servicios
 app.post('/api/internal/get-clinic-credentials', async (req, res) => {
     const internalSecret = req.headers['x-internal-secret'];
     if (!internalSecret || internalSecret !== process.env.INTERNAL_SECRET_KEY) {
