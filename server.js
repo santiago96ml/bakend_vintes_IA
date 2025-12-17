@@ -406,7 +406,7 @@ app.post('/api/onboarding/interactive', requireAuth, upload.single('file'), asyn
 
         // CORRECCIÓN APLICADA: Modelo más estable (Gemini Flash)
         const completion = await openai.chat.completions.create({
-            model: "google/gemma-3-27b-it:free", 
+            model: "mistralai/devstral-2512:free", 
             messages: [
                 { role: "system", content: systemPrompt },
                 { role: "user", content: userContent }
