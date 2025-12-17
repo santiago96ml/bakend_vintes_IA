@@ -598,7 +598,7 @@ app.post('/api/templates/instantiate', requireAuth, async (req, res) => {
 });
 
 // =================================================================
-// RUTAS INFRAESTRUCTURA (Configuración Dinámica + Auto-Reparación V2)
+// RUTAS INFRAESTRUCTURA (Configuración Dinámica + Auto-Reparación BLINDADA)
 // =================================================================
 
 app.get('/api/config/init-session', async (req, res) => {
@@ -607,29 +607,37 @@ app.get('/api/config/init-session', async (req, res) => {
     const token = authHeader.split(' ')[1];
     
     try {
+        // 1. Validar Token con Supabase Auth
         const { data: { user }, error } = await masterSupabase.auth.getUser(token);
         if (error || !user) return res.status(401).json({ error: 'Sesión inválida' });
         
-        // --- 🛡️ AUTO-REPARACIÓN A PRUEBA DE FALLOS ---
-        // Usamos UPSERT con ignoreDuplicates:true (en lógica) para asegurar que existan
-        // sin sobrescribir datos si ya existen.
+        console.log(`🔍 [INIT-SESSION] Verificando usuario: ${user.email} (${user.id})`);
+
+        // --- 🛡️ AUTO-REPARACIÓN OBLIGATORIA (UPSERT) ---
+        // No preguntamos si existe. Mandamos la orden de guardar.
+        // "onConflict: id" asegura que si ya existe, no se duplique ni de error.
         
-        // 1. Asegurar Usuario en tabla pública
-        await masterSupabase.from('users').upsert({
+        // A. Asegurar tabla 'users'
+        const { error: userError } = await masterSupabase.from('users').upsert({
             id: user.id,
             email: user.email,
-            full_name: user.user_metadata?.full_name || user.email.split('@')[0],
+            full_name: user.user_metadata?.full_name || user.user_metadata?.name || user.email.split('@')[0],
             role: 'admin',
-            created_at: new Date()
-        }, { onConflict: 'id', ignoreDuplicates: true });
+            // Solo actualizamos 'last_login' si ya existe, o creamos todo si es nuevo
+            created_at: new Date() 
+        }, { onConflict: 'id' });
 
-        // 2. Asegurar Servicios (CRÍTICO: Si esto falta, el usuario es zombie)
-        await masterSupabase.from('servisi').upsert({
+        if (userError) console.error("⚠️ Error Auto-Reparando User:", userError.message);
+
+        // B. Asegurar tabla 'servisi' (CRÍTICO para que el sistema funcione)
+        const { error: serviceError } = await masterSupabase.from('servisi').upsert({
             "ID_User": user.id, 
             web_clinica: true, 
             "Bot_clinica": true
-        }, { onConflict: "ID_User", ignoreDuplicates: true });
+        }, { onConflict: "ID_User" });
 
+        if (serviceError) console.error("⚠️ Error Auto-Reparando Servicios:", serviceError.message);
+        
         // ------------------------------------------------
 
         // 3. Buscar configuración de la Clínica
@@ -639,8 +647,13 @@ app.get('/api/config/init-session', async (req, res) => {
             .eq('ID_USER', user.id)
             .maybeSingle(); 
             
-        if (!config) return res.status(200).json({ hasClinic: false });
+        // Log para que veas en Easypanel qué está pasando
+        if (!config) {
+            console.log(`🆕 Usuario ${user.email} NO tiene clínica. Enviando a Onboarding.`);
+            return res.status(200).json({ hasClinic: false });
+        }
         
+        console.log(`✅ Usuario ${user.email} TIENE clínica. Enviando a Dashboard.`);
         return res.json({
             hasClinic: true, 
             backendUrl: SATELLITE_URL, 
@@ -650,7 +663,7 @@ app.get('/api/config/init-session', async (req, res) => {
         });
 
     } catch (e) {
-        console.error("Error Init Session:", e.message);
+        console.error("🔥 Error FATAL en Init Session:", e.message);
         return res.status(500).json({ error: 'Error recuperando configuración.' });
     }
 });
