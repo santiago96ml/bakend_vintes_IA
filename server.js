@@ -414,7 +414,36 @@ app.post('/api/onboarding/interactive', requireAuth, upload.single('file'), asyn
             response_format: { type: "json_object" }
         });
 
-        const aiThinking = JSON.parse(completion.choices[0].message.content);
+        // 1. Obtener el contenido crudo
+        let rawContent = completion.choices[0].message.content;
+
+        console.log("🤖 IA Raw Response:", rawContent); // LOG para depuración
+
+        // 2. Limpieza de caracteres problemáticos (Markdown y texto extra)
+        // Elimina los bloques de código ```json y ```
+        rawContent = rawContent.replace(/```json/g, '').replace(/```/g, '').trim();
+
+        // Intenta encontrar el inicio y fin del JSON por si la IA agregó texto antes o después
+        const firstBrace = rawContent.indexOf('{');
+        const lastBrace = rawContent.lastIndexOf('}');
+
+        if (firstBrace !== -1 && lastBrace !== -1) {
+            rawContent = rawContent.substring(firstBrace, lastBrace + 1);
+        }
+
+        // 3. Parseo seguro
+        let aiThinking;
+        try {
+            aiThinking = JSON.parse(rawContent);
+        } catch (parseError) {
+            console.error("❌ Error parseando JSON de la IA:", parseError);
+            console.error("Contenido que falló:", rawContent);
+            // Respuesta de emergencia para que el frontend no se rompa
+            return res.status(500).json({ 
+                error: "La IA generó una respuesta inválida. Intenta de nuevo.",
+                raw: rawContent
+            });
+        }
 
         await masterSupabase
             .from('onboarding_session')
