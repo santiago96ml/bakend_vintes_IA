@@ -598,34 +598,61 @@ app.post('/api/templates/instantiate', requireAuth, async (req, res) => {
 });
 
 // =================================================================
-// RUTAS INFRAESTRUCTURA (Configuración Dinámica)
+// RUTAS INFRAESTRUCTURA (Configuración Dinámica + Auto-Reparación)
 // =================================================================
 
 app.get('/api/config/init-session', async (req, res) => {
     const authHeader = req.headers.authorization;
     if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
     const token = authHeader.split(' ')[1];
-
+    
     try {
+        // 1. Verificar Autenticación en Supabase Auth
         const { data: { user }, error } = await masterSupabase.auth.getUser(token);
         if (error || !user) return res.status(401).json({ error: 'Sesión inválida' });
+        
+        // --- 🛡️ AUTO-REPARACIÓN DE USUARIOS ZOMBIES ---
+        // Verificamos si existe en la tabla pública 'users'
+        const { data: publicUser } = await masterSupabase
+            .from('users')
+            .select('id')
+            .eq('id', user.id)
+            .maybeSingle();
 
-        // --- MODIFICACIÓN CLAVE PARA SERVER-DRIVEN UI ---
+        // SI NO EXISTE EN PÚBLICO (Pero sí en Auth), LO CREAMOS AQUÍ
+        if (!publicUser) {
+            console.log(`🔧 Reparando usuario detectado: ${user.email}`);
+            await masterSupabase.from('users').insert({
+                id: user.id,
+                email: user.email,
+                full_name: user.user_metadata?.full_name || user.user_metadata?.name || user.email.split('@')[0],
+                role: 'admin',
+                created_at: new Date()
+            });
+            // También aseguramos sus servicios
+            await masterSupabase.from('servisi').upsert({
+                "ID_User": user.id, web_clinica: true, "Bot_clinica": true
+            }, { onConflict: "ID_User" });
+        }
+        // ------------------------------------------------
+
+        // 2. Buscar configuración de la Clínica
         const { data: config } = await masterSupabase
             .from('web_clinica')
             .select('SUPABASE_URL, SUPABASE_ANON_KEY, ui_config')
             .eq('ID_USER', user.id)
-            .single();
-
+            .maybeSingle(); // Usamos maybeSingle para que no lance error si es null
+            
         if (!config) return res.status(200).json({ hasClinic: false });
-
+        
         return res.json({
-            hasClinic: true,
-            backendUrl: SATELLITE_URL,
-            supabaseUrl: config.SUPABASE_URL,
+            hasClinic: true, 
+            backendUrl: SATELLITE_URL, 
+            supabaseUrl: config.SUPABASE_URL, 
             supabaseAnonKey: config.SUPABASE_ANON_KEY,
-            uiConfig: config.ui_config
+            uiConfig: config.ui_config 
         });
+
     } catch (e) {
         console.error("Error Init Session:", e.message);
         return res.status(500).json({ error: 'Error recuperando configuración.' });
