@@ -269,8 +269,9 @@ app.post('/api/register', authLimiter, validate(registerSchema), async (req, res
         if (!authData.user) throw new Error("Error en creación de usuario.");
         const userId = authData.user.id;
 
+        // CORRECCIÓN APLICADA: role -> role_admin
         const { error: userError } = await masterSupabase.from('users').insert({
-            id: userId, email, full_name, role: 'admin', created_at: new Date()
+            id: userId, email, full_name, role_admin: true, created_at: new Date()
         });
 
         if (userError) console.error("Error insertando user profile:", userError);
@@ -302,8 +303,9 @@ app.post('/api/start-trial', authLimiter, validate(trialSchema), async (req, res
         });
         if (authError) throw authError;
         const userId = authData.user.id;
+        // CORRECCIÓN APLICADA: role -> role_admin
         await masterSupabase.from('users').insert({
-            id: userId, email, full_name, phone, role: 'admin'
+            id: userId, email, full_name, phone, role_admin: true
         });
         await masterSupabase.from('servisi').insert({
             "ID_User": userId, web_clinica: true, "Bot_clinica": true
@@ -335,21 +337,19 @@ app.post('/api/login', authLimiter, validate(loginSchema), async (req, res) => {
     }
 });
 
-// 4. CHAT ARQUITECTO INTERACTIVO (Onboarding con Archivos y Memoria) - NUEVO 🚀
+// 4. CHAT ARQUITECTO INTERACTIVO
 app.post('/api/onboarding/interactive', requireAuth, upload.single('file'), async (req, res) => {
-    const { message, sessionId } = req.body; // Mensaje del usuario
-    const file = req.file; // Archivo adjunto (si hay)
+    const { message, sessionId } = req.body; 
+    const file = req.file; 
     const userId = req.user.id;
 
     try {
-        // 1. RECUPERAR MEMORIA (Simulando Redis)
         let { data: session } = await masterSupabase
             .from('onboarding_session')
             .select('*')
             .eq('user_id', userId)
             .maybeSingle();
 
-        // Si no existe sesión, creamos una
         if (!session) {
             const { data: newSession } = await masterSupabase
                 .from('onboarding_session')
@@ -359,28 +359,21 @@ app.post('/api/onboarding/interactive', requireAuth, upload.single('file'), asyn
             session = newSession;
         }
 
-        // 2. PROCESAR ARCHIVOS (Ojos del Bot) 👁️
         let fileContext = "";
         if (file) {
             console.log(`📂 Procesando archivo: ${file.originalname}`);
-
             if (file.mimetype.includes('csv') || file.mimetype.includes('spreadsheet')) {
-                // Leer Excel/CSV
                 const workbook = xlsx.read(file.buffer, { type: 'buffer' });
                 const sheetName = workbook.SheetNames[0];
                 const sheet = workbook.Sheets[sheetName];
-                // Convertimos a JSON (Solo las primeras 20 filas para no saturar a la IA)
                 const dataPreview = xlsx.utils.sheet_to_json(sheet, { header: 1 }).slice(0, 20);
                 fileContext = `EL USUARIO SUBIÓ UN ARCHIVO DE DATOS (${file.originalname}). 
                 ESTA ES UNA MUESTRA DE LA ESTRUCTURA:\n${JSON.stringify(dataPreview)}`;
             } else if (file.mimetype.startsWith('image/')) {
-                // Aquí podrías usar GPT-4o Vision para describir la imagen (placeholder)
                 fileContext = `[IMAGEN RECIBIDA: ${file.originalname} - Análisis de visión pendiente]`;
             }
         }
 
-        // 3. PENSAMIENTO DE LA IA (El Consultor Experto "Vintex Architect") 🧠
-        // Reemplazo del prompt genérico por el Prompt Experto de Consultoría No-Code
         const systemPrompt = `
         Eres "Vintex Architect", un Consultor de Producto experto en diseñar aplicaciones de gestión estilo Airtable/No-Code.
         
@@ -411,8 +404,9 @@ app.post('/api/onboarding/interactive', requireAuth, upload.single('file'), asyn
 
         const userContent = `Usuario dice: "${message || ''}". \n ${fileContext}`;
 
+        // CORRECCIÓN APLICADA: Modelo más estable (Gemini Flash)
         const completion = await openai.chat.completions.create({
-            model: "meta-llama/llama-3.3-70b-instruct:free", // Modelo potente
+            model: "google/gemma-3-27b-it:free", 
             messages: [
                 { role: "system", content: systemPrompt },
                 { role: "user", content: userContent }
@@ -422,7 +416,6 @@ app.post('/api/onboarding/interactive', requireAuth, upload.single('file'), asyn
 
         const aiThinking = JSON.parse(completion.choices[0].message.content);
 
-        // 4. ACTUALIZAR MEMORIA (Guardar estado)
         await masterSupabase
             .from('onboarding_session')
             .update({
@@ -441,7 +434,7 @@ app.post('/api/onboarding/interactive', requireAuth, upload.single('file'), asyn
     }
 });
 
-// 5. COMPLETAR ONBOARDING (FINALIZAR Y DESPLEGAR)
+// 5. COMPLETAR ONBOARDING
 app.post('/api/onboarding/complete', requireAuth, validate(onboardingCompleteSchema), async (req, res) => {
     const { conversationSummary, schemaConfig } = req.body;
     const user = req.user;
@@ -454,7 +447,6 @@ app.post('/api/onboarding/complete', requireAuth, validate(onboardingCompleteSch
     try {
         console.log(`🚀 [AUTOMATION] Iniciando despliegue para Usuario: ${user.id}`);
 
-        // --- 🛡️ PASO DE SEGURIDAD: VERIFICAR/CREAR USUARIO (Fallback) ---
         const { data: existingUser } = await masterSupabase
             .from('users')
             .select('id')
@@ -463,11 +455,12 @@ app.post('/api/onboarding/complete', requireAuth, validate(onboardingCompleteSch
 
         if (!existingUser) {
             console.log(`⚠️ Usuario ${user.id} no encontrado en tabla pública. Creándolo ahora...`);
+            // CORRECCIÓN APLICADA: role -> role_admin
             const { error: insertError } = await masterSupabase.from('users').insert({
                 id: user.id,
                 email: user.email,
                 full_name: user.user_metadata?.full_name || user.email.split('@')[0],
-                role: 'admin',
+                role_admin: true,
                 created_at: new Date()
             });
 
@@ -477,7 +470,6 @@ app.post('/api/onboarding/complete', requireAuth, validate(onboardingCompleteSch
             }
         }
 
-        // Actualizar suscripción
         const { error: updateError } = await masterSupabase.from('users').update({
             subscription_status: 'active',
             plan_type: 'pro',
@@ -486,7 +478,6 @@ app.post('/api/onboarding/complete', requireAuth, validate(onboardingCompleteSch
 
         if (updateError) console.warn("Advertencia al actualizar usuario:", updateError.message);
 
-        // Disparar n8n
         const payload = {
             userId: user.id,
             email: user.email,
@@ -501,7 +492,6 @@ app.post('/api/onboarding/complete', requireAuth, validate(onboardingCompleteSch
             body: JSON.stringify(payload)
         }).catch(err => console.error("🔥 Error contactando a n8n:", err.message));
 
-        // DB Placeholders
         const { error: dbError } = await masterSupabase
             .from('web_clinica')
             .upsert({
@@ -524,7 +514,7 @@ app.post('/api/onboarding/complete', requireAuth, validate(onboardingCompleteSch
     }
 });
 
-// 6. CHAT GENERAL (Legacy / Uso General)
+// 6. CHAT GENERAL
 app.post('/chat', requireAuth, chatLimiter, validate(chatSchema), async (req, res) => {
     const { message } = req.body;
     const userId = req.user.id;
@@ -557,13 +547,11 @@ app.post('/chat', requireAuth, chatLimiter, validate(chatSchema), async (req, re
     }
 });
 
-// --- RUTA NUEVA: INSTANCIADOR DE PLANTILLAS (Tipo Airtable) ---
+// --- RUTA NUEVA: INSTANCIADOR DE PLANTILLAS ---
 app.post('/api/templates/instantiate', requireAuth, async (req, res) => {
     const { templateId } = req.body;
     const userId = req.user.id;
-
     try {
-        // 1. Buscamos la plantilla maestra
         const { data: template, error: tError } = await masterSupabase
             .from('templates')
             .select('*')
@@ -572,25 +560,22 @@ app.post('/api/templates/instantiate', requireAuth, async (req, res) => {
 
         if (tError || !template) return res.status(404).json({ error: "Plantilla no encontrada" });
 
-        // 2. "Clonamos" la configuración visual al usuario (Preview Instantáneo)
         const { error: updateError } = await masterSupabase
             .from('web_clinica')
             .upsert({
                 ID_USER: userId,
-                ui_config: template.ui_config_template, // Copiamos el diseño
+                ui_config: template.ui_config_template, 
                 source_template_id: template.id,
-                status: 'preview_template' // Estado especial "Previsualizando"
+                status: 'preview_template' 
             }, { onConflict: 'ID_USER' });
 
         if (updateError) throw updateError;
-
         res.json({
             success: true,
             message: "Plantilla cargada en modo previsualización",
             uiConfig: template.ui_config_template,
             systemPrompt: template.ai_system_prompt
         });
-
     } catch (error) {
         console.error("Error instanciando plantilla:", error);
         res.status(500).json({ error: "Error al cargar la plantilla" });
@@ -598,7 +583,7 @@ app.post('/api/templates/instantiate', requireAuth, async (req, res) => {
 });
 
 // =================================================================
-// RUTAS INFRAESTRUCTURA (Configuración Dinámica + Auto-Reparación BLINDADA)
+// RUTAS INFRAESTRUCTURA (Configuración Dinámica + Auto-Reparación)
 // =================================================================
 
 app.get('/api/config/init-session', async (req, res) => {
@@ -607,29 +592,22 @@ app.get('/api/config/init-session', async (req, res) => {
     const token = authHeader.split(' ')[1];
     
     try {
-        // 1. Validar Token con Supabase Auth
         const { data: { user }, error } = await masterSupabase.auth.getUser(token);
         if (error || !user) return res.status(401).json({ error: 'Sesión inválida' });
         
         console.log(`🔍 [INIT-SESSION] Verificando usuario: ${user.email} (${user.id})`);
 
-        // --- 🛡️ AUTO-REPARACIÓN OBLIGATORIA (UPSERT) ---
-        // No preguntamos si existe. Mandamos la orden de guardar.
-        // "onConflict: id" asegura que si ya existe, no se duplique ni de error.
-        
-        // A. Asegurar tabla 'users'
+        // CORRECCIÓN APLICADA: role -> role_admin
         const { error: userError } = await masterSupabase.from('users').upsert({
             id: user.id,
             email: user.email,
             full_name: user.user_metadata?.full_name || user.user_metadata?.name || user.email.split('@')[0],
-            role: 'admin',
-            // Solo actualizamos 'last_login' si ya existe, o creamos todo si es nuevo
+            role_admin: true,
             created_at: new Date() 
         }, { onConflict: 'id' });
 
         if (userError) console.error("⚠️ Error Auto-Reparando User:", userError.message);
 
-        // B. Asegurar tabla 'servisi' (CRÍTICO para que el sistema funcione)
         const { error: serviceError } = await masterSupabase.from('servisi').upsert({
             "ID_User": user.id, 
             web_clinica: true, 
@@ -638,16 +616,12 @@ app.get('/api/config/init-session', async (req, res) => {
 
         if (serviceError) console.error("⚠️ Error Auto-Reparando Servicios:", serviceError.message);
         
-        // ------------------------------------------------
-
-        // 3. Buscar configuración de la Clínica
         const { data: config } = await masterSupabase
             .from('web_clinica')
             .select('SUPABASE_URL, SUPABASE_ANON_KEY, ui_config')
             .eq('ID_USER', user.id)
             .maybeSingle(); 
             
-        // Log para que veas en Easypanel qué está pasando
         if (!config) {
             console.log(`🆕 Usuario ${user.email} NO tiene clínica. Enviando a Onboarding.`);
             return res.status(200).json({ hasClinic: false });
@@ -668,7 +642,6 @@ app.get('/api/config/init-session', async (req, res) => {
     }
 });
 
-// Ruta interna para n8n u otros servicios
 app.post('/api/internal/get-clinic-credentials', async (req, res) => {
     const internalSecret = req.headers['x-internal-secret'];
     if (!internalSecret || internalSecret !== process.env.INTERNAL_SECRET_KEY) {
@@ -683,7 +656,6 @@ app.post('/api/internal/get-clinic-credentials', async (req, res) => {
             .eq('ID_USER', userId)
             .single();
         if (!config) return res.status(404).json({ error: 'Configuración no encontrada' });
-
         res.json({ url: config.SUPABASE_URL, key: config.SUPABASE_SERVICE_KEY });
     } catch (e) {
         console.error("Error Internal Credentials:", e.message);
