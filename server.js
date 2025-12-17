@@ -6,13 +6,16 @@ import { rateLimit } from 'express-rate-limit';
 import helmet from 'helmet';
 import { z } from 'zod';
 import crypto from 'crypto';
-import OpenAI from 'openai'; 
+import OpenAI from 'openai';
+import multer from 'multer';
+import xlsx from 'xlsx';
+import { Readable } from 'stream';
 
 dotenv.config();
 const app = express();
 
-// 1. TRUST PROXY (Importante para Rate Limits tras proxys como Easypanel/Cloudflare)
-app.set('trust proxy', 1); 
+// 1. TRUST PROXY
+app.set('trust proxy', 1);
 
 const PORT = process.env.PORT || 3000;
 
@@ -20,9 +23,9 @@ const PORT = process.env.PORT || 3000;
 if (!process.env.MASTER_ENCRYPTION_KEY) {
     console.warn("⚠️ ADVERTENCIA: Falta MASTER_ENCRYPTION_KEY. Usando clave temporal insegura.");
 }
-const ENCRYPTION_KEY = process.env.MASTER_ENCRYPTION_KEY 
-    ? Buffer.from(process.env.MASTER_ENCRYPTION_KEY, 'hex') 
-    : crypto.randomBytes(32); 
+const ENCRYPTION_KEY = process.env.MASTER_ENCRYPTION_KEY
+    ? Buffer.from(process.env.MASTER_ENCRYPTION_KEY, 'hex')
+    : crypto.randomBytes(32);
 const IV_LENGTH = 16;
 
 // Funciones Auxiliares Crypto
@@ -49,9 +52,9 @@ function decrypt(text) {
 // --- CONFIGURACIÓN OPENROUTER (IA) ---
 let openai;
 if (process.env.OPENROUTER_API_KEY) {
-    openai = new OpenAI({ 
+    openai = new OpenAI({
         apiKey: process.env.OPENROUTER_API_KEY,
-        baseURL: "https://openrouter.ai/api/v1", 
+        baseURL: "https://openrouter.ai/api/v1",
         defaultHeaders: {
             "HTTP-Referer": process.env.FRONTEND_URL || "https://vintex.net.br",
             "X-Title": "Vintex AI",
@@ -67,54 +70,60 @@ const FRONTEND_URL = process.env.FRONTEND_URL || "https://vintex.net.br";
 const HOSTINGER_URL = "https://webs-de-vintex-login-web.1kh9sk.easypanel.host";
 
 const ALLOWED_ORIGINS = [
-    FRONTEND_URL, 
+    FRONTEND_URL,
     HOSTINGER_URL,
-    'https://vintex.net.br', 
+    'https://vintex.net.br',
     'http://localhost:5173', // Desarrollo Local
     'http://localhost:3000'
 ];
 
 // --- MIDDLEWARES SEGURIDAD ---
 
-// 1. Helmet (Cabeceras HTTP seguras)
+// 1. Helmet
 app.use(helmet({
-  contentSecurityPolicy: {
-    directives: {
-      defaultSrc: ["'self'"],
-      scriptSrc: ["'self'"],
-      upgradeInsecureRequests: [],
+    contentSecurityPolicy: {
+        directives: {
+            defaultSrc: ["'self'"],
+            scriptSrc: ["'self'"],
+            upgradeInsecureRequests: [],
+        },
     },
-  },
-  strictTransportSecurity: {
-    maxAge: 31536000,
-    includeSubDomains: true,
-    preload: true
-  }
+    strictTransportSecurity: {
+        maxAge: 31536000,
+        includeSubDomains: true,
+        preload: true
+    }
 }));
 
-// 2. CORS (Modo Estricto)
+// 2. CORS
 app.use(cors({
     origin: (origin, callback) => {
         if (!origin || ALLOWED_ORIGINS.includes(origin)) {
             callback(null, true);
         } else {
             console.warn(`[CORS SECURITY] Bloqueo para origen no autorizado: ${origin}`);
-            callback(new Error('Bloqueado por CORS')); 
+            callback(new Error('Bloqueado por CORS'));
         }
     },
     methods: ['GET', 'POST', 'PATCH', 'DELETE'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'x-internal-secret'], 
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-internal-secret'],
     credentials: true
 }));
 
-// 3. Body Parser (LÍMITE AUMENTADO PARA CHAT LARGO)
-app.use(express.json({ limit: '50mb' })); 
+// 3. Body Parser
+app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// 4. Rate Limits (Protección contra DDOS y Fuerza Bruta)
+// Configuración de Multer (Memoria temporal para archivos)
+const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 10 * 1024 * 1024 } // 10MB Límite
+});
+
+// 4. Rate Limits
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    limit: 300, 
+    limit: 300,
     message: { error: "Demasiadas peticiones. Intenta más tarde." },
     standardHeaders: true,
     legacyHeaders: false,
@@ -123,13 +132,13 @@ app.use(limiter);
 
 const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    limit: 50, 
+    limit: 50,
     message: { error: "Demasiados intentos de autenticación. Seguridad activada." }
 });
 
 const chatLimiter = rateLimit({
-    windowMs: 3 * 60 * 60 * 1000, 
-    limit: 100, 
+    windowMs: 3 * 60 * 60 * 1000,
+    limit: 100,
     message: { error: "Límite de chat excedido por seguridad." },
     standardHeaders: true,
     legacyHeaders: false,
@@ -153,7 +162,7 @@ const sanitizeLog = (obj) => {
 app.use((req, res, next) => {
     console.log(`\n🔵 [REQUEST] ${req.method} ${req.url}`);
     if (req.body && Object.keys(req.body).length > 0 && process.env.NODE_ENV !== 'production') {
-         console.log('   Payload:', JSON.stringify(sanitizeLog(req.body), null, 2));
+        console.log('   Payload:', JSON.stringify(sanitizeLog(req.body), null, 2));
     }
     next();
 });
@@ -165,12 +174,12 @@ if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
 }
 
 const masterSupabase = createClient(
-  process.env.SUPABASE_URL, 
-  process.env.SUPABASE_SERVICE_KEY,
-  { auth: { autoRefreshToken: false, persistSession: false } }
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_SERVICE_KEY,
+    { auth: { autoRefreshToken: false, persistSession: false } }
 );
 
-// --- SCHEMAS ZOD (Validación de Datos) ---
+// --- SCHEMAS ZOD ---
 const registerSchema = z.object({
     email: z.string().email(),
     password: z.string().min(8, "Contraseña insegura"),
@@ -190,7 +199,7 @@ const loginSchema = z.object({
 
 const chatSchema = z.object({
     message: z.string().min(1).max(2000),
-    threadId: z.string().optional() 
+    threadId: z.string().optional()
 });
 
 const onboardingChatSchema = z.object({
@@ -218,7 +227,7 @@ const validate = (schema) => (req, res, next) => {
 const requireAuth = async (req, res, next) => {
     const authHeader = req.headers.authorization;
     if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
-    
+
     const token = authHeader.split(' ')[1];
     try {
         const { data: { user }, error } = await masterSupabase.auth.getUser(token);
@@ -251,36 +260,36 @@ const detectPromptInjection = (text) => {
 
 // 1. REGISTRO
 app.post('/api/register', authLimiter, validate(registerSchema), async (req, res) => {
-  const { email, password, full_name } = req.body;
-  try {
-    const { data: authData, error: authError } = await masterSupabase.auth.signUp({
-      email, password, options: { data: { full_name } }
-    });
-    if (authError) throw authError;
-    if (!authData.user) throw new Error("Error en creación de usuario.");
-    const userId = authData.user.id;
+    const { email, password, full_name } = req.body;
+    try {
+        const { data: authData, error: authError } = await masterSupabase.auth.signUp({
+            email, password, options: { data: { full_name } }
+        });
+        if (authError) throw authError;
+        if (!authData.user) throw new Error("Error en creación de usuario.");
+        const userId = authData.user.id;
 
-    const { error: userError } = await masterSupabase.from('users').insert({
-        id: userId, email, full_name, role: 'admin', created_at: new Date()
-    });
-    
-    if (userError) console.error("Error insertando user profile:", userError);
+        const { error: userError } = await masterSupabase.from('users').insert({
+            id: userId, email, full_name, role: 'admin', created_at: new Date()
+        });
 
-    await masterSupabase.from('servisi').insert({
-        "ID_User": userId, 
-        web_clinica: true, 
-        "Bot_clinica": true 
-    });
+        if (userError) console.error("Error insertando user profile:", userError);
 
-    res.status(200).json({
-      message: 'Usuario registrado correctamente',
-      user: { id: authData.user.id, email: authData.user.email },
-      session: authData.session 
-    });
-  } catch (error) {
-    console.error("Registro error:", error.message); 
-    res.status(400).json({ error: error.message || 'Error al procesar el registro.' });
-  }
+        await masterSupabase.from('servisi').insert({
+            "ID_User": userId,
+            web_clinica: true,
+            "Bot_clinica": true
+        });
+
+        res.status(200).json({
+            message: 'Usuario registrado correctamente',
+            user: { id: authData.user.id, email: authData.user.email },
+            session: authData.session
+        });
+    } catch (error) {
+        console.error("Registro error:", error.message);
+        res.status(400).json({ error: error.message || 'Error al procesar el registro.' });
+    }
 });
 
 // 2. START TRIAL
@@ -296,10 +305,10 @@ app.post('/api/start-trial', authLimiter, validate(trialSchema), async (req, res
         await masterSupabase.from('users').insert({
             id: userId, email, full_name, phone, role: 'admin'
         });
-        await masterSupabase.from('servisi').insert({ 
-            "ID_User": userId, web_clinica: true, "Bot_clinica": true 
+        await masterSupabase.from('servisi').insert({
+            "ID_User": userId, web_clinica: true, "Bot_clinica": true
         });
-        console.log(`[INFO] Usuario Trial creado: ${email}`); 
+        console.log(`[INFO] Usuario Trial creado: ${email}`);
         return res.status(201).json({ success: true, message: 'Usuario registrado. Revisa tu email.' });
     } catch (error) {
         console.error("Trial error:", error.message);
@@ -326,80 +335,117 @@ app.post('/api/login', authLimiter, validate(loginSchema), async (req, res) => {
     }
 });
 
-// 4. CHAT ARQUITECTO (Onboarding)
-app.post('/api/onboarding/chat', requireAuth, validate(onboardingChatSchema), async (req, res) => {
-    const { messages } = req.body;
+// 4. CHAT ARQUITECTO INTERACTIVO (Onboarding con Archivos y Memoria) - NUEVO 🚀
+app.post('/api/onboarding/interactive', requireAuth, upload.single('file'), async (req, res) => {
+    const { message, sessionId } = req.body; // Mensaje del usuario
+    const file = req.file; // Archivo adjunto (si hay)
     const userId = req.user.id;
 
-    if (detectPromptInjection(messages)) {
-        console.warn(`[SECURITY] Prompt Injection detectado en Onboarding. User: ${userId}`);
-        return res.status(400).json({ error: "Entrada no permitida por políticas de seguridad." });
-    }
-    
-    const systemPrompt = `Eres "Vintex Architect", un Consultor de Producto experto en diseñar aplicaciones de gestión estilo Airtable/No-Code.
-TU OBJETIVO: Entrevistar al usuario para definir su modelo de negocio y, CRÍTICAMENTE, cómo quiere VISUALIZAR sus datos.
-
-REGLAS DE INTERACCIÓN:
-1.  Haz UNA sola pregunta a la vez.
-2.  Mantén un tono profesional pero cercano.
-3.  Tu objetivo final es generar un "RESUMEN TÉCNICO" que servirá de input para un sistema automático.
-
-FASES DE LA ENTREVISTA:
-
-FASE 1: EL NEGOCIO
-- Pregunta: "¡Hola! Vamos a construir tu app. Primero, ¿cuál es el nombre de tu proyecto y a qué se dedica principalmente?"
-- Objetivo: Identificar el rubro (Clínica, Taller, Tienda, etc.).
-
-FASE 2: LOS DATOS (ENTIDADES)
-- Basado en el rubro, sugiere las entidades principales.
-- Pregunta: "Para gestionar [Negocio], necesitaremos registrar cosas. Por ejemplo: Clientes, Pedidos, Inventario. ¿Cuáles son las 3 cosas más importantes que necesitas controlar?"
-
-FASE 3: VISTAS Y EXPERIENCIA (CRÍTICO PARA UI)
-- Aquí debes definir el diseño.
-- PREGUNTA OBLIGATORIA: "Hablemos de cómo quieres trabajar. Para tus datos principales (como [Entidad mencionada]), ¿te gustaría verlos en un CALENDARIO (para fechas), en un TABLERO KANBAN (para mover tarjetas por etapas como 'Pendiente' -> 'Listo'), o prefieres una lista simple?"
-- Si eligen Kanban: Pregunta "¿Qué estados debería tener? (Ej: Pendiente, En Proceso, Finalizado)".
-- Si eligen Calendario: Confirma qué fecha es la importante (Ej: Fecha de Cita, Fecha de Entrega).
-
-FASE 4: CAMPOS ESPECIALES
-- Pregunta: "¿Necesitas guardar archivos adjuntos (fotos/PDFs) o cobrar a través de la app?"
-
-CIERRE Y GENERACIÓN:
-- Cuando tengas todo claro, di: "Perfecto, tengo la estructura lista. Procedo a generar tu configuración."
-- IMPORTANTE: Tu último mensaje DEBE incluir un bloque llamado "MEMORIA TÉCNICA" con este formato exacto (para que la IA de backend lo lea):
-
---- MEMORIA TÉCNICA ---
-NEGOCIO: [Nombre]
-RUBRO: [Rubro]
-TABLAS PRINCIPALES: [Lista de tablas]
-VISTA PREFERIDA: [CALENDARIO / KANBAN / LISTA / GALERÍA]
-ESTADOS KANBAN: [Lista de estados o N/A]
-FUNCIONALIDADES EXTRA: [Pagos, Archivos, etc.]
-RESUMEN: [Breve descripción de 2 líneas del flujo completo]
------------------------`;
-
     try {
+        // 1. RECUPERAR MEMORIA (Simulando Redis)
+        let { data: session } = await masterSupabase
+            .from('onboarding_session')
+            .select('*')
+            .eq('user_id', userId)
+            .maybeSingle();
+
+        // Si no existe sesión, creamos una
+        if (!session) {
+            const { data: newSession } = await masterSupabase
+                .from('onboarding_session')
+                .insert({ user_id: userId, extracted_context: {} })
+                .select()
+                .single();
+            session = newSession;
+        }
+
+        // 2. PROCESAR ARCHIVOS (Ojos del Bot) 👁️
+        let fileContext = "";
+        if (file) {
+            console.log(`📂 Procesando archivo: ${file.originalname}`);
+
+            if (file.mimetype.includes('csv') || file.mimetype.includes('spreadsheet')) {
+                // Leer Excel/CSV
+                const workbook = xlsx.read(file.buffer, { type: 'buffer' });
+                const sheetName = workbook.SheetNames[0];
+                const sheet = workbook.Sheets[sheetName];
+                // Convertimos a JSON (Solo las primeras 20 filas para no saturar a la IA)
+                const dataPreview = xlsx.utils.sheet_to_json(sheet, { header: 1 }).slice(0, 20);
+                fileContext = `EL USUARIO SUBIÓ UN ARCHIVO DE DATOS (${file.originalname}). 
+                ESTA ES UNA MUESTRA DE LA ESTRUCTURA:\n${JSON.stringify(dataPreview)}`;
+            } else if (file.mimetype.startsWith('image/')) {
+                // Aquí podrías usar GPT-4o Vision para describir la imagen (placeholder)
+                fileContext = `[IMAGEN RECIBIDA: ${file.originalname} - Análisis de visión pendiente]`;
+            }
+        }
+
+        // 3. PENSAMIENTO DE LA IA (El Consultor Experto "Vintex Architect") 🧠
+        // Reemplazo del prompt genérico por el Prompt Experto de Consultoría No-Code
+        const systemPrompt = `
+        Eres "Vintex Architect", un Consultor de Producto experto en diseñar aplicaciones de gestión estilo Airtable/No-Code.
+        
+        MEMORIA ACTUAL DEL USUARIO: ${JSON.stringify(session.extracted_context)}
+
+        TU OBJETIVO: Entrevistar al usuario para definir su modelo de negocio y, CRÍTICAMENTE, cómo quiere VISUALIZAR sus datos.
+        
+        REGLAS DE INTERACCIÓN:
+        1. Analiza lo que dice el usuario y los archivos que sube.
+        2. Haz UNA sola pregunta a la vez. Sé conciso.
+        3. Si suben un Excel, deduce las tablas basándote en las columnas.
+        4. Decide si sugieres una plantilla existente o sigues preguntando.
+
+        FASES DE LA ENTREVISTA (Guía interna):
+        - FASE 1 (NEGOCIO): Identificar rubro.
+        - FASE 2 (DATOS): Sugerir entidades (Clientes, Pedidos, etc).
+        - FASE 3 (VISTAS): ¿Calendario, Kanban o Lista? Si es Kanban, pedir estados.
+        - FASE 4 (EXTRAS): Archivos, cobros.
+
+        DEVUELVE SOLO JSON:
+        {
+            "reply": "Tu respuesta al usuario (usando el tono de Vintex Architect)",
+            "updated_context": { ...datos extraídos actualizados... },
+            "suggested_template_id": (null o ID si encaja perfecto con una plantilla de la BD),
+            "is_ready": (true/false si ya tienes suficiente info para construir)
+        }
+        `;
+
+        const userContent = `Usuario dice: "${message || ''}". \n ${fileContext}`;
+
         const completion = await openai.chat.completions.create({
-            model: "nvidia/nemotron-3-nano-30b-a3b:free", 
+            model: "meta-llama/llama-3.3-70b-instruct:free", // Modelo potente
             messages: [
                 { role: "system", content: systemPrompt },
-                ...messages
+                { role: "user", content: userContent }
             ],
-            temperature: 0.5,
-            max_tokens: 600,
+            response_format: { type: "json_object" }
         });
 
-        res.json({ response: completion.choices[0]?.message?.content });
+        const aiThinking = JSON.parse(completion.choices[0].message.content);
+
+        // 4. ACTUALIZAR MEMORIA (Guardar estado)
+        await masterSupabase
+            .from('onboarding_session')
+            .update({
+                conversation_history: [...session.conversation_history, { role: 'user', content: message }, { role: 'assistant', content: aiThinking.reply }],
+                extracted_context: aiThinking.updated_context,
+                suggested_template_id: aiThinking.suggested_template_id,
+                analysis_status: aiThinking.is_ready ? 'ready' : 'listening'
+            })
+            .eq('session_id', session.session_id);
+
+        res.json(aiThinking);
+
     } catch (e) {
-        console.error("Error Arquitecto:", e);
-        res.status(503).json({ error: "El arquitecto está pensando... reintenta." });
+        console.error("Error en Interactive Onboarding:", e);
+        res.status(500).json({ error: "Error procesando tu solicitud." });
     }
 });
 
-// 5. COMPLETAR ONBOARDING (MODIFICADO: CON FALLBACK DE USUARIO)
+// 5. COMPLETAR ONBOARDING (FINALIZAR Y DESPLEGAR)
 app.post('/api/onboarding/complete', requireAuth, validate(onboardingCompleteSchema), async (req, res) => {
     const { conversationSummary, schemaConfig } = req.body;
     const user = req.user;
-    const N8N_URL = process.env.N8N_DEPLOY_WEBHOOK_URL; 
+    const N8N_URL = process.env.N8N_DEPLOY_WEBHOOK_URL;
 
     if (!N8N_URL) {
         return res.status(500).json({ error: "Error de configuración del sistema." });
@@ -408,8 +454,7 @@ app.post('/api/onboarding/complete', requireAuth, validate(onboardingCompleteSch
     try {
         console.log(`🚀 [AUTOMATION] Iniciando despliegue para Usuario: ${user.id}`);
 
-        // --- 🛡️ PASO DE SEGURIDAD: VERIFICAR/CREAR USUARIO ---
-        // Verificamos si el usuario ya tiene perfil en la tabla 'users'
+        // --- 🛡️ PASO DE SEGURIDAD: VERIFICAR/CREAR USUARIO (Fallback) ---
         const { data: existingUser } = await masterSupabase
             .from('users')
             .select('id')
@@ -418,12 +463,9 @@ app.post('/api/onboarding/complete', requireAuth, validate(onboardingCompleteSch
 
         if (!existingUser) {
             console.log(`⚠️ Usuario ${user.id} no encontrado en tabla pública. Creándolo ahora...`);
-            
-            // Lo creamos manualmente usando los datos del Token (Google)
             const { error: insertError } = await masterSupabase.from('users').insert({
                 id: user.id,
                 email: user.email,
-                // Intentamos sacar el nombre de los metadatos de Google, o usamos el email
                 full_name: user.user_metadata?.full_name || user.email.split('@')[0],
                 role: 'admin',
                 created_at: new Date()
@@ -434,10 +476,9 @@ app.post('/api/onboarding/complete', requireAuth, validate(onboardingCompleteSch
                 throw new Error("No se pudo crear el perfil del usuario.");
             }
         }
-        // -----------------------------------------------------
 
-        // Ahora sí, actualizamos el estado (Ya es seguro porque el usuario existe)
-        const { error: updateError } = await masterSupabase.from('users').update({ 
+        // Actualizar suscripción
+        const { error: updateError } = await masterSupabase.from('users').update({
             subscription_status: 'active',
             plan_type: 'pro',
             last_payment_date: new Date(),
@@ -445,12 +486,12 @@ app.post('/api/onboarding/complete', requireAuth, validate(onboardingCompleteSch
 
         if (updateError) console.warn("Advertencia al actualizar usuario:", updateError.message);
 
-        // Disparamos n8n
+        // Disparar n8n
         const payload = {
             userId: user.id,
             email: user.email,
             companyName: schemaConfig?.appName || "Mi Negocio",
-            description: conversationSummary, 
+            description: conversationSummary,
             source: "chat_onboarding_architect"
         };
 
@@ -460,17 +501,17 @@ app.post('/api/onboarding/complete', requireAuth, validate(onboardingCompleteSch
             body: JSON.stringify(payload)
         }).catch(err => console.error("🔥 Error contactando a n8n:", err.message));
 
-        // Placeholders DB
+        // DB Placeholders
         const { error: dbError } = await masterSupabase
             .from('web_clinica')
-            .upsert({ 
+            .upsert({
                 "ID_USER": user.id,
                 "SUPABASE_URL": "https://building.vintex.ai",
                 "SUPABASE_ANON_KEY": "building",
                 "SUPABASE_SERVICE_KEY": "building",
                 "JWT_SECRET": "building",
                 "url_backend": "https://building.vintex.ai",
-                "status": "building" // Marcamos que se está construyendo
+                "status": "building"
             }, { onConflict: "ID_USER" });
 
         if (dbError) throw dbError;
@@ -483,9 +524,9 @@ app.post('/api/onboarding/complete', requireAuth, validate(onboardingCompleteSch
     }
 });
 
-// 6. CHAT GENERAL
+// 6. CHAT GENERAL (Legacy / Uso General)
 app.post('/chat', requireAuth, chatLimiter, validate(chatSchema), async (req, res) => {
-    const { message } = req.body; 
+    const { message } = req.body;
     const userId = req.user.id;
 
     if (detectPromptInjection(message)) {
@@ -495,11 +536,11 @@ app.post('/chat', requireAuth, chatLimiter, validate(chatSchema), async (req, re
 
     try {
         const completion = await openai.chat.completions.create({
-            model: "tngtech/deepseek-r1t2-chimera:free", 
+            model: "tngtech/deepseek-r1t2-chimera:free",
             messages: [
-                { 
-                    role: "system", 
-                    content: "Eres Vintex AI, un asistente experto en gestión de clínicas y negocios." 
+                {
+                    role: "system",
+                    content: "Eres Vintex AI, un asistente experto en gestión de clínicas y negocios."
                 },
                 { role: "user", content: message }
             ],
@@ -516,6 +557,46 @@ app.post('/chat', requireAuth, chatLimiter, validate(chatSchema), async (req, re
     }
 });
 
+// --- RUTA NUEVA: INSTANCIADOR DE PLANTILLAS (Tipo Airtable) ---
+app.post('/api/templates/instantiate', requireAuth, async (req, res) => {
+    const { templateId } = req.body;
+    const userId = req.user.id;
+
+    try {
+        // 1. Buscamos la plantilla maestra
+        const { data: template, error: tError } = await masterSupabase
+            .from('templates')
+            .select('*')
+            .eq('id', templateId)
+            .single();
+
+        if (tError || !template) return res.status(404).json({ error: "Plantilla no encontrada" });
+
+        // 2. "Clonamos" la configuración visual al usuario (Preview Instantáneo)
+        const { error: updateError } = await masterSupabase
+            .from('web_clinica')
+            .upsert({
+                ID_USER: userId,
+                ui_config: template.ui_config_template, // Copiamos el diseño
+                source_template_id: template.id,
+                status: 'preview_template' // Estado especial "Previsualizando"
+            }, { onConflict: 'ID_USER' });
+
+        if (updateError) throw updateError;
+
+        res.json({
+            success: true,
+            message: "Plantilla cargada en modo previsualización",
+            uiConfig: template.ui_config_template,
+            systemPrompt: template.ai_system_prompt
+        });
+
+    } catch (error) {
+        console.error("Error instanciando plantilla:", error);
+        res.status(500).json({ error: "Error al cargar la plantilla" });
+    }
+});
+
 // =================================================================
 // RUTAS INFRAESTRUCTURA (Configuración Dinámica)
 // =================================================================
@@ -524,27 +605,26 @@ app.get('/api/config/init-session', async (req, res) => {
     const authHeader = req.headers.authorization;
     if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
     const token = authHeader.split(' ')[1];
-    
+
     try {
         const { data: { user }, error } = await masterSupabase.auth.getUser(token);
         if (error || !user) return res.status(401).json({ error: 'Sesión inválida' });
-        
+
         // --- MODIFICACIÓN CLAVE PARA SERVER-DRIVEN UI ---
-        // Ahora seleccionamos también 'ui_config'
         const { data: config } = await masterSupabase
             .from('web_clinica')
             .select('SUPABASE_URL, SUPABASE_ANON_KEY, ui_config')
             .eq('ID_USER', user.id)
             .single();
-            
+
         if (!config) return res.status(200).json({ hasClinic: false });
-        
+
         return res.json({
-            hasClinic: true, 
-            backendUrl: SATELLITE_URL, 
-            supabaseUrl: config.SUPABASE_URL, 
+            hasClinic: true,
+            backendUrl: SATELLITE_URL,
+            supabaseUrl: config.SUPABASE_URL,
             supabaseAnonKey: config.SUPABASE_ANON_KEY,
-            uiConfig: config.ui_config 
+            uiConfig: config.ui_config
         });
     } catch (e) {
         console.error("Error Init Session:", e.message);
@@ -567,7 +647,7 @@ app.post('/api/internal/get-clinic-credentials', async (req, res) => {
             .eq('ID_USER', userId)
             .single();
         if (!config) return res.status(404).json({ error: 'Configuración no encontrada' });
-        
+
         res.json({ url: config.SUPABASE_URL, key: config.SUPABASE_SERVICE_KEY });
     } catch (e) {
         console.error("Error Internal Credentials:", e.message);
@@ -576,6 +656,6 @@ app.post('/api/internal/get-clinic-credentials', async (req, res) => {
 });
 
 const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 MASTER SERVER SECURED (api-master.vintex.net.br) en puerto ${PORT}`);
+    console.log(`🚀 MASTER SERVER SECURED (api-master.vintex.net.br) en puerto ${PORT}`);
 });
 server.setTimeout(30000);
