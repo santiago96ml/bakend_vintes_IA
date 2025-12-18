@@ -66,7 +66,7 @@ function decrypt(text) {
 
 // --- CONFIGURACIÓN OPENROUTER (DeepSeek R1) ---
 let openai;
-const AI_MODEL = "deepseek/deepseek-r1:free"; // Modelo potente y gratuito
+const AI_MODEL = "tngtech/deepseek-r1t2-chimera:free"; // Modelo potente y gratuito
 
 if (process.env.OPENROUTER_API_KEY) {
     openai = new OpenAI({
