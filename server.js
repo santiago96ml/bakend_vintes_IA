@@ -61,9 +61,9 @@ function decrypt(text) {
 
 // --- CONFIGURACIÓN OPENROUTER (ARQUITECTURA DE NODOS 2025) ---
 let openai;
-const MODEL_ORQUESTADOR = "deepseek/deepseek-r1:free"; 
-const MODEL_ANALISTA = "google/gemini-2.0-flash-exp:free";
-const MODEL_VISION = "qwen/qwen-2.5-vl-72b-instruct:free";
+const MODEL_ORQUESTADOR = "meta-llama/llama-3.1-405b-instruct:free"; 
+const MODEL_ANALISTA = "meta-llama/llama-3.2-3b-instruct:free";
+const MODEL_VISION = "qwen/qwen-2.5-vl-7b-instruct:free";
 
 if (process.env.OPENROUTER_API_KEY) {
     openai = new OpenAI({
