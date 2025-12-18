@@ -2,14 +2,15 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
-import { rateLimit } from 'express-rate-limit';
+import rateLimit from 'express-rate-limit'; // Corregido: importación por defecto suele ser mejor aquí
 import helmet from 'helmet';
 import { z } from 'zod';
 import crypto from 'crypto';
 import OpenAI from 'openai';
 import multer from 'multer';
-import xlsx from 'xlsx';
+import * as xlsx from 'xlsx'; // Corregido: Importación compatible con ESM
 import { Readable } from 'stream';
+import pg from 'pg';
 
 dotenv.config();
 const app = express();
@@ -19,12 +20,23 @@ app.set('trust proxy', 1);
 
 const PORT = process.env.PORT || 3000;
 
-// --- 🔒 SEGURIDAD: CONFIGURACIÓN CRIPTOGRAFÍA ---
-if (!process.env.MASTER_ENCRYPTION_KEY) {
-    console.warn("⚠️ ADVERTENCIA: Falta MASTER_ENCRYPTION_KEY. Usando clave temporal insegura.");
+// --- CONFIGURACIÓN POOL DE BASE DE DATOS (Para crear tablas) ---
+if (!process.env.DATABASE_URL) {
+    console.warn("⚠️ ADVERTENCIA: Falta DATABASE_URL. La construcción automática de tablas fallará.");
 }
-const ENCRYPTION_KEY = process.env.MASTER_ENCRYPTION_KEY
-    ? Buffer.from(process.env.MASTER_ENCRYPTION_KEY, 'hex')
+const dbPool = new pg.Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false } 
+});
+
+// Manejo de errores del pool para evitar caídas
+dbPool.on('error', (err) => {
+    console.error('🔥 Error inesperado en el cliente PG inactivo', err);
+});
+
+// --- SEGURIDAD Y CONFIGURACIÓN GENERAL ---
+const ENCRYPTION_KEY = process.env.MASTER_ENCRYPTION_KEY 
+    ? Buffer.from(process.env.MASTER_ENCRYPTION_KEY, 'hex') 
     : crypto.randomBytes(32);
 const IV_LENGTH = 16;
 
@@ -40,23 +52,28 @@ function encrypt(text) {
 
 function decrypt(text) {
     if (!text) return null;
-    let textParts = text.split(':');
-    let iv = Buffer.from(textParts.shift(), 'hex');
-    let encryptedText = Buffer.from(textParts.join(':'), 'hex');
-    let decipher = crypto.createDecipheriv('aes-256-cbc', Buffer.from(ENCRYPTION_KEY), iv);
-    let decrypted = decipher.update(encryptedText);
-    decrypted = Buffer.concat([decrypted, decipher.final()]);
-    return decrypted.toString();
+    try {
+        let textParts = text.split(':');
+        let iv = Buffer.from(textParts.shift(), 'hex');
+        let encryptedText = Buffer.from(textParts.join(':'), 'hex');
+        let decipher = crypto.createDecipheriv('aes-256-cbc', Buffer.from(ENCRYPTION_KEY), iv);
+        let decrypted = decipher.update(encryptedText);
+        decrypted = Buffer.concat([decrypted, decipher.final()]);
+        return decrypted.toString();
+    } catch (error) {
+        console.error("Error desencriptando:", error);
+        return null;
+    }
 }
 
-// --- CONFIGURACIÓN OPENROUTER (IA) ---
+// Configuración OpenRouter (IA)
 let openai;
 if (process.env.OPENROUTER_API_KEY) {
     openai = new OpenAI({
         apiKey: process.env.OPENROUTER_API_KEY,
-        baseURL: "https://openrouter.ai/api/v1",
+        baseURL: "[https://openrouter.ai/api/v1](https://openrouter.ai/api/v1)",
         defaultHeaders: {
-            "HTTP-Referer": process.env.FRONTEND_URL || "https://vintex.net.br",
+            "HTTP-Referer": process.env.FRONTEND_URL || "[https://vintex.net.br](https://vintex.net.br)",
             "X-Title": "Vintex AI",
         }
     });
@@ -64,115 +81,54 @@ if (process.env.OPENROUTER_API_KEY) {
     console.error("❌ FALTA OPENROUTER_API_KEY en .env");
 }
 
-// --- 🔒 SEGURIDAD: DOMINIOS PERMITIDOS (CORS ESTRICTO) ---
-const SATELLITE_URL = process.env.SATELLITE_URL || "https://api-clinica.vintex.net.br";
-const FRONTEND_URL = process.env.FRONTEND_URL || "https://vintex.net.br";
-const HOSTINGER_URL = "https://webs-de-vintex-login-web.1kh9sk.easypanel.host";
+const SATELLITE_URL = process.env.SATELLITE_URL || "[https://api-clinica.vintex.net.br](https://api-clinica.vintex.net.br)";
+const FRONTEND_URL = process.env.FRONTEND_URL || "[https://vintex.net.br](https://vintex.net.br)";
+const HOSTINGER_URL = "[https://webs-de-vintex-login-web.1kh9sk.easypanel.host](https://webs-de-vintex-login-web.1kh9sk.easypanel.host)";
 
 const ALLOWED_ORIGINS = [
     FRONTEND_URL,
     HOSTINGER_URL,
-    'https://vintex.net.br',
-    'http://localhost:5173', // Desarrollo Local
+    '[https://vintex.net.br](https://vintex.net.br)',
+    'http://localhost:5173',
     'http://localhost:3000'
 ];
 
-// --- MIDDLEWARES SEGURIDAD ---
-
-// 1. Helmet
+// --- MIDDLEWARES ---
 app.use(helmet({
     contentSecurityPolicy: {
-        directives: {
-            defaultSrc: ["'self'"],
-            scriptSrc: ["'self'"],
-            upgradeInsecureRequests: [],
-        },
+        directives: { defaultSrc: ["'self'"], scriptSrc: ["'self'"], upgradeInsecureRequests: [] },
     },
-    strictTransportSecurity: {
-        maxAge: 31536000,
-        includeSubDomains: true,
-        preload: true
-    }
+    strictTransportSecurity: { maxAge: 31536000, includeSubDomains: true, preload: true }
 }));
 
-// 2. CORS
 app.use(cors({
     origin: (origin, callback) => {
-        if (!origin || ALLOWED_ORIGINS.includes(origin)) {
-            callback(null, true);
-        } else {
-            console.warn(`[CORS SECURITY] Bloqueo para origen no autorizado: ${origin}`);
-            callback(new Error('Bloqueado por CORS'));
-        }
+        if (!origin || ALLOWED_ORIGINS.includes(origin)) { callback(null, true); } 
+        else { console.warn(`[CORS] Bloqueo: ${origin}`); callback(new Error('Bloqueado por CORS')); }
     },
     methods: ['GET', 'POST', 'PATCH', 'DELETE'],
     allowedHeaders: ['Content-Type', 'Authorization', 'x-internal-secret'],
     credentials: true
 }));
 
-// 3. Body Parser
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// Configuración de Multer (Memoria temporal para archivos)
-const upload = multer({
-    storage: multer.memoryStorage(),
-    limits: { fileSize: 10 * 1024 * 1024 } // 10MB Límite
-});
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
-// 4. Rate Limits
-const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    limit: 300,
-    message: { error: "Demasiadas peticiones. Intenta más tarde." },
-    standardHeaders: true,
-    legacyHeaders: false,
-});
+// Rate Limits
+const limiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 300 });
 app.use(limiter);
+const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 50 });
+const chatLimiter = rateLimit({ windowMs: 3 * 60 * 60 * 1000, limit: 100 });
 
-const authLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    limit: 50,
-    message: { error: "Demasiados intentos de autenticación. Seguridad activada." }
-});
-
-const chatLimiter = rateLimit({
-    windowMs: 3 * 60 * 60 * 1000,
-    limit: 100,
-    message: { error: "Límite de chat excedido por seguridad." },
-    standardHeaders: true,
-    legacyHeaders: false,
-});
-
-// 5. Logger Sanitizado
-const sanitizeLog = (obj) => {
-    if (!obj) return obj;
-    const copy = { ...obj };
-    const sensitiveKeys = ['password', 'token', 'access_token', 'session', 'secret', 'dni', 'credit_card', 'cvv', 'phone', 'telefono', 'email', 'supab_service_key', 'jwt_secret', 'messages'];
-    Object.keys(copy).forEach(key => {
-        if (sensitiveKeys.includes(key.toLowerCase())) {
-            copy[key] = '***REDACTED***';
-        } else if (typeof copy[key] === 'object' && copy[key] !== null) {
-            copy[key] = sanitizeLog(copy[key]);
-        }
-    });
-    return copy;
-};
-
+// Logger
 app.use((req, res, next) => {
     console.log(`\n🔵 [REQUEST] ${req.method} ${req.url}`);
-    if (req.body && Object.keys(req.body).length > 0 && process.env.NODE_ENV !== 'production') {
-        console.log('   Payload:', JSON.stringify(sanitizeLog(req.body), null, 2));
-    }
     next();
 });
 
 // --- SUPABASE MASTER ---
-if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
-    console.error("❌ FALTA CONFIGURACIÓN: SUPABASE_URL o SUPABASE_SERVICE_KEY.");
-    process.exit(1);
-}
-
 const masterSupabase = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_SERVICE_KEY,
@@ -180,66 +136,31 @@ const masterSupabase = createClient(
 );
 
 // --- SCHEMAS ZOD ---
-const registerSchema = z.object({
-    email: z.string().email(),
-    password: z.string().min(8, "Contraseña insegura"),
-    full_name: z.string().min(2)
-});
-
-const trialSchema = z.object({
-    email: z.string().email(),
-    fullName: z.string().min(2),
-    phone: z.string().min(8)
-});
-
-const loginSchema = z.object({
-    email: z.string().email(),
-    password: z.string()
-});
-
-const chatSchema = z.object({
-    message: z.string().min(1).max(2000),
-    threadId: z.string().optional()
-});
-
-const onboardingChatSchema = z.object({
-    messages: z.array(z.object({
-        role: z.enum(['user', 'assistant', 'system']),
-        content: z.string()
-    }))
-});
-
-const onboardingCompleteSchema = z.object({
-    conversationSummary: z.string().min(10),
-    schemaConfig: z.any().optional()
-});
+const loginSchema = z.object({ email: z.string().email(), password: z.string() });
+const registerSchema = z.object({ email: z.string().email(), password: z.string().min(8), full_name: z.string().min(2) });
+const trialSchema = z.object({ email: z.string().email(), fullName: z.string().min(2), phone: z.string().min(8) });
+const chatSchema = z.object({ message: z.string().min(1).max(2000), threadId: z.string().optional() });
+const onboardingCompleteSchema = z.object({ conversationSummary: z.string().min(10), schemaConfig: z.any().optional() });
+const onboardingChatSchema = z.object({ messages: z.array(z.any()) });
 
 const validate = (schema) => (req, res, next) => {
-    try {
-        schema.parse(req.body);
-        next();
-    } catch (e) {
-        return res.status(400).json({ error: 'Datos inválidos', details: e.errors });
-    }
+    try { schema.parse(req.body); next(); } 
+    catch (e) { return res.status(400).json({ error: 'Datos inválidos', details: e.errors }); }
 };
 
-// --- MIDDLEWARE AUTENTICACIÓN ---
+// Middleware Auth
 const requireAuth = async (req, res, next) => {
     const authHeader = req.headers.authorization;
     if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
-
     const token = authHeader.split(' ')[1];
     try {
         const { data: { user }, error } = await masterSupabase.auth.getUser(token);
         if (error || !user) return res.status(401).json({ error: 'Sesión inválida' });
         req.user = user;
         next();
-    } catch (e) {
-        return res.status(401).json({ error: 'No autorizado' });
-    }
+    } catch (e) { return res.status(401).json({ error: 'No autorizado' }); }
 };
 
-// --- 🔒 SEGURIDAD: ANTI PROMPT INJECTION ---
 const detectPromptInjection = (text) => {
     const patterns = [
         /ignore previous instructions/i, /ignora tus instrucciones/i,
@@ -254,43 +175,120 @@ const detectPromptInjection = (text) => {
     return false;
 };
 
+// --- 🧠 FUNCIÓN MAESTRA: CONSTRUCTOR DE SISTEMAS (Reemplaza a n8n) ---
+async function buildSystemWithAI(userId, summary) {
+    console.log(`🏗️ [CONSTRUCTOR] Iniciando obra para usuario: ${userId}`);
+    
+    if (!openai) {
+        console.error("🔥 Error: OpenAI no inicializado. Abortando construcción.");
+        return;
+    }
+
+    const dbClient = await dbPool.connect(); 
+
+    try {
+        const systemPrompt = `
+        ERES UN INGENIERO DE BASES DE DATOS POSTGRESQL EXPERTO.
+        TU TAREA: Generar un script SQL ejecutable basado en los requisitos del usuario.
+        
+        REQUISITOS DEL USUARIO:
+        "${summary}"
+        
+        REGLAS CRÍTICAS DE SEGURIDAD Y DISEÑO:
+        1.  TODAS las tablas deben tener RLS (Row Level Security) activado.
+        2.  TODAS las tablas deben tener una columna "user_id" tipo UUID que referencie a 'auth.users(id)'.
+        3.  Crea una política RLS para cada tabla que permita al usuario ver/editar SOLO sus filas:
+            Example: CREATE POLICY "Users can manage own data" ON table_name USING (auth.uid() = user_id);
+        4.  Usa tipos de datos adecuados (TEXT, BOOLEAN, TIMESTAMPTZ, NUMERIC).
+        5.  NO borres tablas existentes (usa CREATE TABLE IF NOT EXISTS).
+        6.  Devuelve SOLO el código SQL, sin explicaciones ni markdown (nada de \`\`\`sql).
+        `;
+
+        const completion = await openai.chat.completions.create({
+            model: "meta-llama/llama-3.3-70b-instruct:free", 
+            messages: [{ role: "system", content: systemPrompt }],
+            temperature: 0.2,
+        });
+
+        let sqlCode = completion.choices[0].message.content;
+        
+        // Limpieza robusta del SQL (Elimina bloques de markdown si existen)
+        const sqlMatch = sqlCode.match(/```sql([\s\S]*?)```/) || sqlCode.match(/```([\s\S]*?)```/);
+        if (sqlMatch) {
+            sqlCode = sqlMatch[1].trim();
+        } else {
+            sqlCode = sqlCode.trim();
+        }
+        
+        // Limpiar palabras clave peligrosas muy básicas (opcional, pero recomendado)
+        if (sqlCode.toLowerCase().includes('drop table') || sqlCode.toLowerCase().includes('drop database')) {
+             console.warn("⚠️ ALERTA: La IA intentó borrar tablas. Se bloqueará la ejecución.");
+             throw new Error("Código SQL inseguro detectado.");
+        }
+
+        console.log(`📜 SQL Generado (Preview): ${sqlCode.substring(0, 100)}...`);
+
+        await dbClient.query('BEGIN'); 
+        await dbClient.query(sqlCode);
+
+        const defaultUiConfig = {
+            theme: { primary: "#00E599", mode: "dark" },
+            generatedAt: new Date().toISOString()
+        };
+
+        await dbClient.query(`
+            UPDATE public.web_clinica 
+            SET status = 'active', 
+                ui_config = $1 
+            WHERE "ID_USER" = $2
+        `, [JSON.stringify(defaultUiConfig), userId]);
+
+        await dbClient.query('COMMIT');
+        console.log(`✅ [CONSTRUCTOR] Sistema desplegado con éxito para ${userId}`);
+
+    } catch (error) {
+        await dbClient.query('ROLLBACK');
+        console.error("🔥 [CONSTRUCTOR ERROR]:", error);
+    } finally {
+        dbClient.release();
+    }
+}
+
 // =================================================================
 // RUTAS DE NEGOCIO
 // =================================================================
 
 // 1. REGISTRO
 app.post('/api/register', authLimiter, validate(registerSchema), async (req, res) => {
-    const { email, password, full_name } = req.body;
-    try {
-        const { data: authData, error: authError } = await masterSupabase.auth.signUp({
-            email, password, options: { data: { full_name } }
-        });
-        if (authError) throw authError;
-        if (!authData.user) throw new Error("Error en creación de usuario.");
-        const userId = authData.user.id;
+  const { email, password, full_name } = req.body;
+  try {
+    const { data: authData, error: authError } = await masterSupabase.auth.signUp({
+      email, password, options: { data: { full_name } }
+    });
+    if (authError) throw authError;
+    if (!authData.user) throw new Error("Error en creación de usuario.");
+    const userId = authData.user.id;
 
-        // CORRECCIÓN APLICADA: role -> role_admin
-        const { error: userError } = await masterSupabase.from('users').insert({
-            id: userId, email, full_name, role_admin: true, created_at: new Date()
-        });
+    // Verificar si el usuario ya existe en public.users para evitar duplicados si auth falló a medias
+    const { error: userError } = await masterSupabase.from('users').upsert({
+        id: userId, email, full_name, role: 'admin', created_at: new Date()
+    }, { onConflict: 'id' });
+    
+    if (userError) console.error("Error insertando user profile:", userError);
 
-        if (userError) console.error("Error insertando user profile:", userError);
+    await masterSupabase.from('servisi').upsert({
+        "ID_User": userId, web_clinica: true, "Bot_clinica": true 
+    }, { onConflict: 'ID_User' });
 
-        await masterSupabase.from('servisi').insert({
-            "ID_User": userId,
-            web_clinica: true,
-            "Bot_clinica": true
-        });
-
-        res.status(200).json({
-            message: 'Usuario registrado correctamente',
-            user: { id: authData.user.id, email: authData.user.email },
-            session: authData.session
-        });
-    } catch (error) {
-        console.error("Registro error:", error.message);
-        res.status(400).json({ error: error.message || 'Error al procesar el registro.' });
-    }
+    res.status(200).json({
+      message: 'Usuario registrado correctamente',
+      user: { id: authData.user.id, email: authData.user.email },
+      session: authData.session 
+    });
+  } catch (error) {
+    console.error("Registro error:", error.message); 
+    res.status(400).json({ error: error.message || 'Error al procesar el registro.' });
+  }
 });
 
 // 2. START TRIAL
@@ -303,14 +301,13 @@ app.post('/api/start-trial', authLimiter, validate(trialSchema), async (req, res
         });
         if (authError) throw authError;
         const userId = authData.user.id;
-        // CORRECCIÓN APLICADA: role -> role_admin
-        await masterSupabase.from('users').insert({
-            id: userId, email, full_name, phone, role_admin: true
+        await masterSupabase.from('users').upsert({
+            id: userId, email, full_name: fullName, phone, role: 'admin'
         });
-        await masterSupabase.from('servisi').insert({
-            "ID_User": userId, web_clinica: true, "Bot_clinica": true
+        await masterSupabase.from('servisi').upsert({ 
+            "ID_User": userId, web_clinica: true, "Bot_clinica": true 
         });
-        console.log(`[INFO] Usuario Trial creado: ${email}`);
+        console.log(`[INFO] Usuario Trial creado: ${email}`); 
         return res.status(201).json({ success: true, message: 'Usuario registrado. Revisa tu email.' });
     } catch (error) {
         console.error("Trial error:", error.message);
@@ -337,215 +334,112 @@ app.post('/api/login', authLimiter, validate(loginSchema), async (req, res) => {
     }
 });
 
-// 4. CHAT ARQUITECTO INTERACTIVO
+// 4. CHAT ARQUITECTO (Onboarding Interactivo)
 app.post('/api/onboarding/interactive', requireAuth, upload.single('file'), async (req, res) => {
-    const { message, sessionId } = req.body; 
-    const file = req.file; 
+    const { message } = req.body;
+    const file = req.file;
     const userId = req.user.id;
 
-    try {
-        let { data: session } = await masterSupabase
-            .from('onboarding_session')
-            .select('*')
-            .eq('user_id', userId)
-            .maybeSingle();
+    if (!openai) return res.status(503).json({ error: "IA no disponible" });
 
+    try {
+        let { data: session } = await masterSupabase.from('onboarding_session').select('*').eq('user_id', userId).maybeSingle();
         if (!session) {
-            const { data: newSession } = await masterSupabase
-                .from('onboarding_session')
-                .insert({ user_id: userId, extracted_context: {} })
-                .select()
-                .single();
-            session = newSession;
+            const { data: newS } = await masterSupabase.from('onboarding_session').insert({ user_id: userId, extracted_context: {} }).select().single();
+            session = newS;
         }
 
         let fileContext = "";
-        if (file) {
-            console.log(`📂 Procesando archivo: ${file.originalname}`);
-            if (file.mimetype.includes('csv') || file.mimetype.includes('spreadsheet')) {
-                const workbook = xlsx.read(file.buffer, { type: 'buffer' });
-                const sheetName = workbook.SheetNames[0];
-                const sheet = workbook.Sheets[sheetName];
-                const dataPreview = xlsx.utils.sheet_to_json(sheet, { header: 1 }).slice(0, 20);
-                fileContext = `EL USUARIO SUBIÓ UN ARCHIVO DE DATOS (${file.originalname}). 
-                ESTA ES UNA MUESTRA DE LA ESTRUCTURA:\n${JSON.stringify(dataPreview)}`;
-            } else if (file.mimetype.startsWith('image/')) {
-                fileContext = `[IMAGEN RECIBIDA: ${file.originalname} - Análisis de visión pendiente]`;
-            }
+        if (file && (file.mimetype.includes('csv') || file.mimetype.includes('spreadsheet'))) {
+            const workbook = xlsx.read(file.buffer, { type: 'buffer' });
+            const sheet = workbook.Sheets[workbook.SheetNames[0]];
+            const dataPreview = xlsx.utils.sheet_to_json(sheet, { header: 1 }).slice(0, 10);
+            fileContext = `[ARCHIVO ADJUNTO] El usuario subió datos. Estructura: ${JSON.stringify(dataPreview)}`;
         }
 
         const systemPrompt = `
-        Eres "Vintex Architect", un Consultor de Producto experto en diseñar aplicaciones de gestión estilo Airtable/No-Code.
-        
-        MEMORIA ACTUAL DEL USUARIO: ${JSON.stringify(session.extracted_context)}
-
-        TU OBJETIVO: Entrevistar al usuario para definir su modelo de negocio y, CRÍTICAMENTE, cómo quiere VISUALIZAR sus datos.
-        
-        REGLAS DE INTERACCIÓN:
-        1. Analiza lo que dice el usuario y los archivos que sube.
-        2. Haz UNA sola pregunta a la vez. Sé conciso.
-        3. Si suben un Excel, deduce las tablas basándote en las columnas.
-        4. Decide si sugieres una plantilla existente o sigues preguntando.
-
-        FASES DE LA ENTREVISTA (Guía interna):
-        - FASE 1 (NEGOCIO): Identificar rubro.
-        - FASE 2 (DATOS): Sugerir entidades (Clientes, Pedidos, etc).
-        - FASE 3 (VISTAS): ¿Calendario, Kanban o Lista? Si es Kanban, pedir estados.
-        - FASE 4 (EXTRAS): Archivos, cobros.
-
-        DEVUELVE SOLO JSON:
-        {
-            "reply": "Tu respuesta al usuario (usando el tono de Vintex Architect)",
-            "updated_context": { ...datos extraídos actualizados... },
-            "suggested_template_id": (null o ID si encaja perfecto con una plantilla de la BD),
-            "is_ready": (true/false si ya tienes suficiente info para construir)
-        }
+        Eres Vintex Architect. Entrevista al usuario para crear su software.
+        Memoria: ${JSON.stringify(session.extracted_context)}
+        Responde JSON: { "reply": "...", "updated_context": {...}, "is_ready": boolean }
         `;
 
-        const userContent = `Usuario dice: "${message || ''}". \n ${fileContext}`;
-
-        // CORRECCIÓN APLICADA: Modelo más estable (Gemini Flash)
         const completion = await openai.chat.completions.create({
-            model: "mistralai/devstral-2512:free", 
+            model: "meta-llama/llama-3.3-70b-instruct:free",
             messages: [
                 { role: "system", content: systemPrompt },
-                { role: "user", content: userContent }
+                { role: "user", content: `User: ${message}. ${fileContext}` }
             ],
             response_format: { type: "json_object" }
         });
 
-        // 1. Obtener el contenido crudo
-        let rawContent = completion.choices[0].message.content;
+        const aiData = JSON.parse(completion.choices[0].message.content);
 
-        console.log("🤖 IA Raw Response:", rawContent); // LOG para depuración
+        // Validar que conversation_history sea array
+        const history = Array.isArray(session.conversation_history) ? session.conversation_history : [];
 
-        // 2. Limpieza de caracteres problemáticos (Markdown y texto extra)
-        // Elimina los bloques de código ```json y ```
-        rawContent = rawContent.replace(/```json/g, '').replace(/```/g, '').trim();
+        await masterSupabase.from('onboarding_session').update({
+            conversation_history: [...history, { user: message, bot: aiData.reply }],
+            extracted_context: aiData.updated_context,
+            analysis_status: aiData.is_ready ? 'ready' : 'listening'
+        }).eq('session_id', session.session_id);
 
-        // Intenta encontrar el inicio y fin del JSON por si la IA agregó texto antes o después
-        const firstBrace = rawContent.indexOf('{');
-        const lastBrace = rawContent.lastIndexOf('}');
-
-        if (firstBrace !== -1 && lastBrace !== -1) {
-            rawContent = rawContent.substring(firstBrace, lastBrace + 1);
-        }
-
-        // 3. Parseo seguro
-        let aiThinking;
-        try {
-            aiThinking = JSON.parse(rawContent);
-        } catch (parseError) {
-            console.error("❌ Error parseando JSON de la IA:", parseError);
-            console.error("Contenido que falló:", rawContent);
-            // Respuesta de emergencia para que el frontend no se rompa
-            return res.status(500).json({ 
-                error: "La IA generó una respuesta inválida. Intenta de nuevo.",
-                raw: rawContent
-            });
-        }
-
-        await masterSupabase
-            .from('onboarding_session')
-            .update({
-                conversation_history: [...session.conversation_history, { role: 'user', content: message }, { role: 'assistant', content: aiThinking.reply }],
-                extracted_context: aiThinking.updated_context,
-                suggested_template_id: aiThinking.suggested_template_id,
-                analysis_status: aiThinking.is_ready ? 'ready' : 'listening'
-            })
-            .eq('session_id', session.session_id);
-
-        res.json(aiThinking);
-
+        res.json(aiData);
     } catch (e) {
-        console.error("Error en Interactive Onboarding:", e);
-        res.status(500).json({ error: "Error procesando tu solicitud." });
+        console.error(e);
+        res.status(500).json({ error: "Error pensando..." });
     }
 });
 
-// 5. COMPLETAR ONBOARDING
+// 5. COMPLETAR ONBOARDING (¡AHORA SIN N8N!) 🚀
 app.post('/api/onboarding/complete', requireAuth, validate(onboardingCompleteSchema), async (req, res) => {
-    const { conversationSummary, schemaConfig } = req.body;
+    const { conversationSummary } = req.body;
     const user = req.user;
-    const N8N_URL = process.env.N8N_DEPLOY_WEBHOOK_URL;
-
-    if (!N8N_URL) {
-        return res.status(500).json({ error: "Error de configuración del sistema." });
-    }
 
     try {
-        console.log(`🚀 [AUTOMATION] Iniciando despliegue para Usuario: ${user.id}`);
+        console.log(`🚀 Iniciando despliegue LOCAL para Usuario: ${user.id}`);
 
-        const { data: existingUser } = await masterSupabase
-            .from('users')
-            .select('id')
-            .eq('id', user.id)
-            .single();
-
-        if (!existingUser) {
-            console.log(`⚠️ Usuario ${user.id} no encontrado en tabla pública. Creándolo ahora...`);
-            // CORRECCIÓN APLICADA: role -> role_admin
-            const { error: insertError } = await masterSupabase.from('users').insert({
-                id: user.id,
-                email: user.email,
-                full_name: user.user_metadata?.full_name || user.email.split('@')[0],
-                role_admin: true,
-                created_at: new Date()
-            });
-
-            if (insertError) {
-                console.error("❌ Error creando usuario fallback:", insertError);
-                throw new Error("No se pudo crear el perfil del usuario.");
-            }
-        }
-
-        const { error: updateError } = await masterSupabase.from('users').update({
-            subscription_status: 'active',
-            plan_type: 'pro',
-            last_payment_date: new Date(),
-        }).eq('id', user.id);
-
-        if (updateError) console.warn("Advertencia al actualizar usuario:", updateError.message);
-
-        const payload = {
-            userId: user.id,
+        // --- AUTO-REPARACIÓN (UPSERT) ---
+        await masterSupabase.from('users').upsert({
+            id: user.id,
             email: user.email,
-            companyName: schemaConfig?.appName || "Mi Negocio",
-            description: conversationSummary,
-            source: "chat_onboarding_architect"
-        };
+            full_name: user.email.split('@')[0],
+            role: 'admin',
+            created_at: new Date()
+        }, { onConflict: 'id', ignoreDuplicates: true });
 
-        fetch(N8N_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-        }).catch(err => console.error("🔥 Error contactando a n8n:", err.message));
+        await masterSupabase.from('servisi').upsert({
+            "ID_User": user.id, web_clinica: true, "Bot_clinica": true
+        }, { onConflict: "ID_User", ignoreDuplicates: true });
 
-        const { error: dbError } = await masterSupabase
-            .from('web_clinica')
-            .upsert({
-                "ID_USER": user.id,
-                "SUPABASE_URL": "https://building.vintex.ai",
-                "SUPABASE_ANON_KEY": "building",
-                "SUPABASE_SERVICE_KEY": "building",
-                "JWT_SECRET": "building",
-                "url_backend": "https://building.vintex.ai",
-                "status": "building"
-            }, { onConflict: "ID_USER" });
+        // --- ESTADO INICIAL: BUILDING ---
+        const { error: dbError } = await masterSupabase.from('web_clinica').upsert({ 
+            "ID_USER": user.id,
+            "SUPABASE_URL": "[https://building.vintex.ai](https://building.vintex.ai)",
+            "SUPABASE_ANON_KEY": "building",
+            "SUPABASE_SERVICE_KEY": "building",
+            "JWT_SECRET": "building",
+            "status": "building" 
+        }, { onConflict: "ID_USER" });
 
         if (dbError) throw dbError;
 
-        res.json({ success: true, message: "Despliegue iniciado." });
+        // --- 🔥 EL REEMPLAZO DE N8N 🔥 ---
+        // Se ejecuta sin await para no bloquear la respuesta HTTP
+        buildSystemWithAI(user.id, conversationSummary).catch(err => 
+            console.error("🔥 Error asíncrono en constructor:", err)
+        );
+
+        res.json({ success: true, message: "Arquitecto trabajando en segundo plano..." });
 
     } catch (error) {
-        console.error("Error Fatal en Onboarding:", error);
-        res.status(500).json({ error: "Error procesando el despliegue." });
+        console.error("Error Onboarding:", error);
+        res.status(500).json({ error: "Error iniciando construcción." });
     }
 });
 
-// 6. CHAT GENERAL
+// 6. CHAT GENERAL (Legacy)
 app.post('/chat', requireAuth, chatLimiter, validate(chatSchema), async (req, res) => {
-    const { message } = req.body;
+    const { message } = req.body; 
     const userId = req.user.id;
 
     if (detectPromptInjection(message)) {
@@ -553,14 +447,13 @@ app.post('/chat', requireAuth, chatLimiter, validate(chatSchema), async (req, re
         return res.status(400).json({ error: "Entrada no permitida." });
     }
 
+    if (!openai) return res.status(503).json({ error: "Servicio de IA no disponible" });
+
     try {
         const completion = await openai.chat.completions.create({
-            model: "tngtech/deepseek-r1t2-chimera:free",
+            model: "tngtech/deepseek-r1t2-chimera:free", 
             messages: [
-                {
-                    role: "system",
-                    content: "Eres Vintex AI, un asistente experto en gestión de clínicas y negocios."
-                },
+                { role: "system", content: "Eres Vintex AI, un asistente experto en gestión." },
                 { role: "user", content: message }
             ],
             temperature: 0.7,
@@ -572,91 +465,73 @@ app.post('/chat', requireAuth, chatLimiter, validate(chatSchema), async (req, re
 
     } catch (e) {
         console.error("Error Chat OpenRouter:", e);
-        res.status(503).json({ error: "El servicio de IA está ocupado, intenta de nuevo." });
+        res.status(503).json({ error: "El servicio de IA está ocupado." });
     }
 });
 
-// --- RUTA NUEVA: INSTANCIADOR DE PLANTILLAS ---
+// 7. INSTANCIADOR DE PLANTILLAS
 app.post('/api/templates/instantiate', requireAuth, async (req, res) => {
     const { templateId } = req.body;
     const userId = req.user.id;
+
     try {
-        const { data: template, error: tError } = await masterSupabase
-            .from('templates')
-            .select('*')
-            .eq('id', templateId)
-            .single();
+        const { data: template } = await masterSupabase.from('templates').select('*').eq('id', templateId).single();
+        if (!template) return res.status(404).json({ error: "Plantilla no encontrada" });
 
-        if (tError || !template) return res.status(404).json({ error: "Plantilla no encontrada" });
+        await masterSupabase.from('web_clinica').upsert({
+            ID_USER: userId,
+            ui_config: template.ui_config_template, 
+            status: 'preview_template' 
+        }, { onConflict: 'ID_USER' });
 
-        const { error: updateError } = await masterSupabase
-            .from('web_clinica')
-            .upsert({
-                ID_USER: userId,
-                ui_config: template.ui_config_template, 
-                source_template_id: template.id,
-                status: 'preview_template' 
-            }, { onConflict: 'ID_USER' });
-
-        if (updateError) throw updateError;
-        res.json({
-            success: true,
-            message: "Plantilla cargada en modo previsualización",
-            uiConfig: template.ui_config_template,
-            systemPrompt: template.ai_system_prompt
-        });
+        res.json({ success: true, message: "Plantilla cargada" });
     } catch (error) {
         console.error("Error instanciando plantilla:", error);
         res.status(500).json({ error: "Error al cargar la plantilla" });
     }
 });
 
-// =================================================================
-// RUTAS INFRAESTRUCTURA (Configuración Dinámica + Auto-Reparación)
-// =================================================================
+// 8. INTERNAL CREDENTIALS (Uso interno)
+app.post('/api/internal/get-clinic-credentials', async (req, res) => {
+    const internalSecret = req.headers['x-internal-secret'];
+    if (!internalSecret || internalSecret !== process.env.INTERNAL_SECRET_KEY) {
+        return res.status(403).json({ error: 'Forbidden' });
+    }
+    const { userId } = req.body;
+    try {
+        const { data: config } = await masterSupabase.from('web_clinica').select('SUPABASE_URL, SUPABASE_SERVICE_KEY').eq('ID_USER', userId).single();
+        if (!config) return res.status(404).json({ error: 'No config' });
+        res.json({ url: config.SUPABASE_URL, key: config.SUPABASE_SERVICE_KEY });
+    } catch (e) { res.status(500).json({ error: 'Internal Error' }); }
+});
 
+// 9. INIT SESSION (CON AUTO-REPARACIÓN BLINDADA)
 app.get('/api/config/init-session', async (req, res) => {
     const authHeader = req.headers.authorization;
     if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
-    const token = authHeader.split(' ')[1];
     
     try {
-        const { data: { user }, error } = await masterSupabase.auth.getUser(token);
+        const { data: { user }, error } = await masterSupabase.auth.getUser(authHeader.split(' ')[1]);
         if (error || !user) return res.status(401).json({ error: 'Sesión inválida' });
-        
-        console.log(`🔍 [INIT-SESSION] Verificando usuario: ${user.email} (${user.id})`);
 
-        // CORRECCIÓN APLICADA: role -> role_admin
-        const { error: userError } = await masterSupabase.from('users').upsert({
-            id: user.id,
-            email: user.email,
-            full_name: user.user_metadata?.full_name || user.user_metadata?.name || user.email.split('@')[0],
-            role_admin: true,
-            created_at: new Date() 
-        }, { onConflict: 'id' });
+        // AUTO-REPAIR
+        await masterSupabase.from('users').upsert({
+            id: user.id, email: user.email, full_name: user.email.split('@')[0], role: 'admin', created_at: new Date()
+        }, { onConflict: 'id', ignoreDuplicates: true });
 
-        if (userError) console.error("⚠️ Error Auto-Reparando User:", userError.message);
+        await masterSupabase.from('servisi').upsert({
+            "ID_User": user.id, web_clinica: true, "Bot_clinica": true
+        }, { onConflict: "ID_User", ignoreDuplicates: true });
 
-        const { error: serviceError } = await masterSupabase.from('servisi').upsert({
-            "ID_User": user.id, 
-            web_clinica: true, 
-            "Bot_clinica": true
-        }, { onConflict: "ID_User" });
-
-        if (serviceError) console.error("⚠️ Error Auto-Reparando Servicios:", serviceError.message);
-        
+        // BUSCAR CONFIG
         const { data: config } = await masterSupabase
             .from('web_clinica')
             .select('SUPABASE_URL, SUPABASE_ANON_KEY, ui_config')
             .eq('ID_USER', user.id)
-            .maybeSingle(); 
+            .maybeSingle();
             
-        if (!config) {
-            console.log(`🆕 Usuario ${user.email} NO tiene clínica. Enviando a Onboarding.`);
-            return res.status(200).json({ hasClinic: false });
-        }
+        if (!config) return res.status(200).json({ hasClinic: false });
         
-        console.log(`✅ Usuario ${user.email} TIENE clínica. Enviando a Dashboard.`);
         return res.json({
             hasClinic: true, 
             backendUrl: SATELLITE_URL, 
@@ -666,33 +541,13 @@ app.get('/api/config/init-session', async (req, res) => {
         });
 
     } catch (e) {
-        console.error("🔥 Error FATAL en Init Session:", e.message);
-        return res.status(500).json({ error: 'Error recuperando configuración.' });
-    }
-});
-
-app.post('/api/internal/get-clinic-credentials', async (req, res) => {
-    const internalSecret = req.headers['x-internal-secret'];
-    if (!internalSecret || internalSecret !== process.env.INTERNAL_SECRET_KEY) {
-        return res.status(403).json({ error: 'Forbidden' });
-    }
-    const { userId } = req.body;
-    if (!userId) return res.status(400).json({ error: 'User ID requerido' });
-    try {
-        const { data: config } = await masterSupabase
-            .from('web_clinica')
-            .select('SUPABASE_URL, SUPABASE_SERVICE_KEY')
-            .eq('ID_USER', userId)
-            .single();
-        if (!config) return res.status(404).json({ error: 'Configuración no encontrada' });
-        res.json({ url: config.SUPABASE_URL, key: config.SUPABASE_SERVICE_KEY });
-    } catch (e) {
-        console.error("Error Internal Credentials:", e.message);
-        res.status(500).json({ error: 'Internal Error' });
+        console.error("Error Init:", e);
+        res.status(500).json({ error: 'Error interno' });
     }
 });
 
 const server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 MASTER SERVER SECURED (api-master.vintex.net.br) en puerto ${PORT}`);
+    console.log(`🚀 VINTEX ENGINE (NODE+AI) en puerto ${PORT}`);
 });
-server.setTimeout(30000);
+// Aumentamos el timeout para operaciones largas de IA
+server.setTimeout(60000);
