@@ -71,9 +71,9 @@ let openai;
 if (process.env.OPENROUTER_API_KEY) {
     openai = new OpenAI({
         apiKey: process.env.OPENROUTER_API_KEY,
-        baseURL: "[https://openrouter.ai/api/v1](https://openrouter.ai/api/v1)",
+        baseURL: "https://openrouter.ai/api/v1", // ✅ URL corregida
         defaultHeaders: {
-            "HTTP-Referer": process.env.FRONTEND_URL || "[https://vintex.net.br](https://vintex.net.br)",
+            "HTTP-Referer": process.env.FRONTEND_URL || "https://vintex.net.br", // ✅ URL corregida
             "X-Title": "Vintex AI",
         }
     });
@@ -81,14 +81,15 @@ if (process.env.OPENROUTER_API_KEY) {
     console.error("❌ FALTA OPENROUTER_API_KEY en .env");
 }
 
-const SATELLITE_URL = process.env.SATELLITE_URL || "[https://api-clinica.vintex.net.br](https://api-clinica.vintex.net.br)";
-const FRONTEND_URL = process.env.FRONTEND_URL || "[https://vintex.net.br](https://vintex.net.br)";
-const HOSTINGER_URL = "[https://webs-de-vintex-login-web.1kh9sk.easypanel.host](https://webs-de-vintex-login-web.1kh9sk.easypanel.host)";
+// ✅ URLs corregidas (eliminados los corchetes y paréntesis de Markdown)
+const SATELLITE_URL = process.env.SATELLITE_URL || "https://api-clinica.vintex.net.br";
+const FRONTEND_URL = process.env.FRONTEND_URL || "https://vintex.net.br";
+const HOSTINGER_URL = "https://webs-de-vintex-login-web.1kh9sk.easypanel.host";
 
 const ALLOWED_ORIGINS = [
     FRONTEND_URL,
     HOSTINGER_URL,
-    '[https://vintex.net.br](https://vintex.net.br)',
+    'https://vintex.net.br', // ✅ URL corregida
     'http://localhost:5173',
     'http://localhost:3000'
 ];
@@ -414,7 +415,7 @@ app.post('/api/onboarding/complete', requireAuth, validate(onboardingCompleteSch
         // --- ESTADO INICIAL: BUILDING ---
         const { error: dbError } = await masterSupabase.from('web_clinica').upsert({ 
             "ID_USER": user.id,
-            "SUPABASE_URL": "[https://building.vintex.ai](https://building.vintex.ai)",
+            "SUPABASE_URL": "https://building.vintex.ai", // ✅ URL corregida
             "SUPABASE_ANON_KEY": "building",
             "SUPABASE_SERVICE_KEY": "building",
             "JWT_SECRET": "building",
