@@ -1,6 +1,6 @@
 import express from 'express';
 import cors from 'cors';
-import dotenv from 'dotenv'; // Corregido el typo
+import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import rateLimit from 'express-rate-limit';
 import helmet from 'helmet';
@@ -9,7 +9,6 @@ import crypto from 'crypto';
 import OpenAI from 'openai';
 import multer from 'multer';
 import * as xlsx from 'xlsx';
-import { Readable } from 'stream';
 import pg from 'pg';
 
 dotenv.config();
@@ -26,16 +25,16 @@ if (!process.env.DATABASE_URL) {
 }
 const dbPool = new pg.Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false } 
+    ssl: { rejectUnauthorized: false }
 });
 
 dbPool.on('error', (err) => {
     console.error('🔥 Error inesperado en el cliente PG inactivo', err);
 });
 
-// --- SEGURIDAD (Encriptación restaurada) ---
-const ENCRYPTION_KEY = process.env.MASTER_ENCRYPTION_KEY 
-    ? Buffer.from(process.env.MASTER_ENCRYPTION_KEY, 'hex') 
+// --- SEGURIDAD (Encriptación) ---
+const ENCRYPTION_KEY = process.env.MASTER_ENCRYPTION_KEY
+    ? Buffer.from(process.env.MASTER_ENCRYPTION_KEY, 'hex')
     : crypto.randomBytes(32);
 const IV_LENGTH = 16;
 
@@ -64,9 +63,9 @@ function decrypt(text) {
     }
 }
 
-// --- CONFIGURACIÓN OPENROUTER (DeepSeek R1) ---
+// --- CONFIGURACIÓN OPENROUTER (DeepSeek R1 oficial y estable) ---
 let openai;
-const AI_MODEL = "tngtech/deepseek-r1t2-chimera:free"; // Modelo potente y gratuito
+const AI_MODEL = "tngtech/deepseek-r1t2-chimera:free"; // Modelo oficial recomendado
 
 if (process.env.OPENROUTER_API_KEY) {
     openai = new OpenAI({
@@ -104,7 +103,7 @@ app.use(helmet({
 app.use(cors({
     origin: (origin, callback) => {
         if (!origin || ALLOWED_ORIGINS.includes(origin)) { callback(null, true); } 
-        else { callback(null, true); } 
+        else { callback(null, true); } // Nota: en producción, considerar restringir más
     },
     methods: ['GET', 'POST', 'PATCH', 'DELETE'],
     allowedHeaders: ['Content-Type', 'Authorization', 'x-internal-secret'],
@@ -135,26 +134,66 @@ const masterSupabase = createClient(
     { auth: { autoRefreshToken: false, persistSession: false } }
 );
 
-// --- 🔧 UTILIDAD DE LIMPIEZA PARA DEEPSEEK R1 ---
+// --- UTILIDADES DE IA ---
 function cleanDeepSeekResponse(content) {
     if (!content) return "";
-    
-    // 1. Eliminar el proceso de pensamiento <think>...</think>
     let clean = content.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
 
-    // 2. Intentar extraer JSON de bloques de código markdown ```json ... ```
     const jsonMatch = clean.match(/```json([\s\S]*?)```/);
     if (jsonMatch) return jsonMatch[1].trim();
 
-    // 3. Intentar extraer SQL de bloques ```sql ... ```
     const sqlMatch = clean.match(/```sql([\s\S]*?)```/);
     if (sqlMatch) return sqlMatch[1].trim();
 
-    // 4. Si no hay markdown, buscar el primer '{' y el último '}' para JSON
     const braceMatch = clean.match(/\{[\s\S]*\}/);
     if (braceMatch) return braceMatch[0];
 
     return clean;
+}
+
+function shouldStream(chunk, isThinking) {
+    if (chunk.includes('<think>')) return { emit: false, thinking: true };
+    if (chunk.includes('</think>')) return { emit: false, thinking: false };
+    return { emit: !isThinking, thinking: isThinking };
+}
+
+// --- MEJOR LECTURA DE EXCEL/CSV: Resumen inteligente ---
+function analyzeExcelFile(buffer) {
+    try {
+        const workbook = xlsx.read(buffer, { type: 'buffer' });
+        const sheetName = workbook.SheetNames[0];
+        const sheet = workbook.Sheets[sheetName];
+        const jsonData = xlsx.utils.sheet_to_json(sheet, { header: 1, defval: null });
+
+        if (jsonData.length === 0) return "[ARCHIVO VACÍO]";
+
+        const headers = jsonData[0];
+        const dataRows = jsonData.slice(1);
+        const sampleRows = dataRows.slice(0, 8); // Máximo 8 filas de ejemplo
+        const totalRows = dataRows.length;
+
+        // Inferir tipos básicos por columna
+        const columnTypes = headers.map((header, i) => {
+            const values = dataRows.map(row => row[i]).filter(v => v !== null && v !== undefined);
+            if (values.length === 0) return "vacío";
+            if (values.every(v => typeof v === 'number')) return "número";
+            if (values.every(v => typeof v === 'string' && !isNaN(Date.parse(v)))) return "fecha";
+            return "texto";
+        });
+
+        return `
+[ARCHIVO EXCEL/CSV ANALIZADO]
+Hoja: "${sheetName}"
+Columnas (${headers.length}): ${headers.join(', ')}
+Tipos aproximados: ${columnTypes.join(', ')}
+Total filas de datos: ${totalRows}
+Ejemplos (primeras ${sampleRows.length} filas):
+${JSON.stringify(sampleRows, null, 2)}
+`.trim();
+    } catch (error) {
+        console.error("Error analizando Excel:", error);
+        return "[ERROR AL LEER ARCHIVO]";
+    }
 }
 
 // --- SCHEMAS ZOD ---
@@ -183,31 +222,33 @@ const requireAuth = async (req, res, next) => {
 };
 
 const detectPromptInjection = (text) => {
-    const patterns = [
-        /ignore previous instructions/i, /ignora tus instrucciones/i,
-        /system prompt/i, /act as a/i, /actúa como/i, /reset instructions/i
-    ];
-    if (typeof text === 'string') return patterns.some(pattern => pattern.test(text));
-    return false;
+    const patterns = [/ignore previous instructions/i, /ignora tus instrucciones/i, /system prompt/i, /act as a/i, /actúa como/i, /reset instructions/i];
+    return typeof text === 'string' && patterns.some(pattern => pattern.test(text));
 };
 
-// --- 🧠 CONSTRUCTOR DE SISTEMAS CON DEEPSEEK R1 ---
+// --- 🧠 CONSTRUCTOR DE SISTEMAS (Prompt mejorado del Código 1) ---
 async function buildSystemWithAI(userId, summary) {
-    console.log(`🏗️ [CONSTRUCTOR] Iniciando obra para usuario: ${userId}`);
+    console.log(`🏗️ [CONSTRUCTOR] Iniciando construcción para usuario: ${userId}`);
     
     if (!openai) return;
+
     const dbClient = await dbPool.connect(); 
 
     try {
         const systemPrompt = `
         ERES UN INGENIERO DE BASES DE DATOS POSTGRESQL EXPERTO.
-        TU TAREA: Generar un script SQL para: "${summary}"
+        TU TAREA: Generar un script SQL completo para: "${summary}"
         
-        REGLAS:
-        1. Tablas con RLS activado.
-        2. Columna "user_id" (UUID) en todas las tablas que referencie a auth.users.
-        3. CREATE POLICY "Manage own data" ON table USING (auth.uid() = user_id);
-        4. Devuelve SOLO el código SQL dentro de un bloque markdown.
+        REGLAS OBLIGATORIAS:
+        1. Todas las tablas deben tener RLS activado (ENABLE ROW LEVEL SECURITY).
+        2. Todas las tablas que contengan datos del usuario deben tener una columna "user_id" UUID que referencie auth.users(id).
+        3. Crear políticas: CREATE POLICY "Manage own data" ON tabla USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
+        4. Incluir políticas para SELECT, INSERT, UPDATE, DELETE si aplica.
+        5. Usar tipos adecuados (timestamptz, jsonb cuando sea útil).
+        6. Incluir índices útiles en columnas de búsqueda frecuente.
+        
+        Devuelve SOLO el código SQL dentro de un bloque markdown \`\`\`sql ... \`\`\`
+        NO agregues explicaciones, ni texto fuera del bloque.
         `;
 
         const completion = await openai.chat.completions.create({
@@ -216,14 +257,13 @@ async function buildSystemWithAI(userId, summary) {
             temperature: 0.1, 
         });
 
-        // Limpieza específica para R1
         let rawContent = completion.choices[0].message.content;
         let sqlCode = cleanDeepSeekResponse(rawContent);
 
-        // Limpieza extra por seguridad
-        if (sqlCode.startsWith('```')) sqlCode = sqlCode.replace(/```sql|```/g, '');
+        // Limpieza extra de seguridad
+        if (sqlCode.startsWith('```')) sqlCode = sqlCode.replace(/```sql|```/g, '').trim();
         
-        console.log(`📜 SQL Generado: ${sqlCode.substring(0, 50)}...`);
+        console.log(`📜 SQL Generado (primeros 100 chars): ${sqlCode.substring(0, 100)}...`);
 
         await dbClient.query('BEGIN'); 
         await dbClient.query(sqlCode);
@@ -239,7 +279,7 @@ async function buildSystemWithAI(userId, summary) {
         `, [JSON.stringify(defaultUiConfig), userId]);
 
         await dbClient.query('COMMIT');
-        console.log(`✅ [CONSTRUCTOR] Sistema listo para ${userId}`);
+        console.log(`✅ [CONSTRUCTOR] Sistema construido con éxito para ${userId}`);
 
     } catch (error) {
         await dbClient.query('ROLLBACK');
@@ -253,17 +293,14 @@ async function buildSystemWithAI(userId, summary) {
 // RUTAS
 // =================================================================
 
-// 1. REGISTER
 app.post('/api/register', authLimiter, validate(registerSchema), async (req, res) => {
     const { email, password, full_name } = req.body;
     try {
         const { data, error } = await masterSupabase.auth.signUp({ email, password, options: { data: { full_name } } });
-        
         if (error) return res.status(400).json({ error: error.message });
         
-        // Upsert perfil para consistencia
-        await masterSupabase.from('users').upsert({ id: data.user.id, email, full_name, role: 'admin' }, { onConflict: 'id' });
-        await masterSupabase.from('servisi').upsert({ "ID_User": data.user.id, web_clinica: true, "Bot_clinica": true }, { onConflict: 'ID_User' });
+        await masterSupabase.from('users').upsert({ id: data.user.id, email, full_name, role: 'admin' }, { onConflict: 'id', ignoreDuplicates: true });
+        await masterSupabase.from('servisi').upsert({ "ID_User": data.user.id, web_clinica: true, "Bot_clinica": true }, { onConflict: 'ID_User', ignoreDuplicates: true });
 
         res.json({ user: data.user, session: data.session });
     } catch (error) {
@@ -272,7 +309,6 @@ app.post('/api/register', authLimiter, validate(registerSchema), async (req, res
     }
 });
 
-// 2. START TRIAL (Restaurado)
 app.post('/api/start-trial', authLimiter, validate(trialSchema), async (req, res) => {
     const { email, fullName, phone } = req.body;
     const tempPassword = crypto.randomBytes(16).toString('hex') + "V!1";
@@ -283,17 +319,16 @@ app.post('/api/start-trial', authLimiter, validate(trialSchema), async (req, res
         if (authError) throw authError;
         const userId = authData.user.id;
         
-        await masterSupabase.from('users').upsert({ id: userId, email, full_name: fullName, phone, role: 'admin' });
-        await masterSupabase.from('servisi').upsert({ "ID_User": userId, web_clinica: true, "Bot_clinica": true });
+        await masterSupabase.from('users').upsert({ id: userId, email, full_name: fullName, phone, role: 'admin' }, { onConflict: 'id', ignoreDuplicates: true });
+        await masterSupabase.from('servisi').upsert({ "ID_User": userId, web_clinica: true, "Bot_clinica": true }, { onConflict: 'ID_User', ignoreDuplicates: true });
         
-        return res.status(201).json({ success: true, message: 'Usuario registrado. Revisa tu email.' });
+        return res.status(201).json({ success: true, message: 'Usuario creado exitosamente. Revisa tu email para ingresar.' });
     } catch (error) {
         console.error("Trial error:", error.message);
         return res.status(500).json({ error: 'Error interno del servidor.' });
     }
 });
 
-// 3. LOGIN
 app.post('/api/login', authLimiter, validate(loginSchema), async (req, res) => {
     const { email, password } = req.body;
     const { data, error } = await masterSupabase.auth.signInWithPassword({ email, password });
@@ -301,13 +336,17 @@ app.post('/api/login', authLimiter, validate(loginSchema), async (req, res) => {
     return res.json({ success: true, session: data.session, user: { id: data.user.id, email: data.user.email } });
 });
 
-// 4. CHAT ARQUITECTO (Onboarding Interactivo con DeepSeek R1 y Excel)
+// CHAT ARQUITECTO CON STREAMING + ANÁLISIS INTELIGENTE DE EXCEL
 app.post('/api/onboarding/interactive', requireAuth, upload.single('file'), async (req, res) => {
     const { message } = req.body;
     const file = req.file;
     const userId = req.user.id;
 
     if (!openai) return res.status(503).json({ error: "IA no disponible" });
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
 
     try {
         let { data: session } = await masterSupabase.from('onboarding_session').select('*').eq('user_id', userId).maybeSingle();
@@ -317,101 +356,106 @@ app.post('/api/onboarding/interactive', requireAuth, upload.single('file'), asyn
         }
 
         let fileContext = "";
-        // Restaurada lógica de Excel para dar contexto a la IA
-        if (file && (file.mimetype.includes('csv') || file.mimetype.includes('spreadsheet'))) {
-            const workbook = xlsx.read(file.buffer, { type: 'buffer' });
-            const sheet = workbook.Sheets[workbook.SheetNames[0]];
-            const dataPreview = xlsx.utils.sheet_to_json(sheet, { header: 1 }).slice(0, 10);
-            fileContext = `[ARCHIVO ADJUNTO] El usuario subió datos. Estructura: ${JSON.stringify(dataPreview)}`;
+        if (file && (file.mimetype.includes('csv') || file.mimetype.includes('spreadsheet') || file.originalname.endsWith('.xlsx') || file.originalname.endsWith('.xls'))) {
+            fileContext = analyzeExcelFile(file.buffer);
         } else if (file) {
-            fileContext = "[Archivo recibido]";
+            fileContext = `[Archivo recibido: ${file.originalname} (${file.mimetype})]`;
         }
 
         const systemPrompt = `
-        Eres Vintex Architect. Entrevista al usuario.
-        Memoria actual: ${JSON.stringify(session.extracted_context)}
+        Eres Vintex Architect, un experto en diseño de software médico y de gestión.
+        Tu objetivo es entrevistar al usuario para entender sus necesidades y extraer requisitos claros.
+        Memoria actual del proyecto: ${JSON.stringify(session.extracted_context)}
         
-        OBJETIVO: Obtener detalles para construir el software.
-        
-        FORMATO DE RESPUESTA REQUERIDO (JSON PURO):
+        FORMATO DE RESPUESTA OBLIGATORIO (JSON PURO, nada más):
         { 
-            "reply": "Tu respuesta al usuario...", 
-            "updated_context": { ...datos extraídos... }, 
-            "is_ready": boolean (true si ya tienes toda la info básica) 
+            "reply": "Respuesta natural y amigable al usuario...", 
+            "updated_context": { ...datos extraídos y acumulados... }, 
+            "is_ready": true/false (true solo si ya tienes información suficiente para construir el sistema)
         }
-        NO escribas nada fuera del JSON.
+        NO escribas nada fuera del JSON. NO uses markdown.
         `;
 
-        const completion = await openai.chat.completions.create({
-            model: AI_MODEL, // DeepSeek R1 Free
+        const stream = await openai.chat.completions.create({
+            model: AI_MODEL,
             messages: [
                 { role: "system", content: systemPrompt },
-                { role: "user", content: `User: ${message}. ${fileContext}` }
+                { role: "user", content: `Usuario: ${message}\n${fileContext}` }
             ],
-            // response_format ELIMINADO para compatibilidad
+            stream: true
         });
 
-        // ✅ LIMPIEZA DEEPSEEK
-        let rawContent = completion.choices[0].message.content;
-        let cleanContent = cleanDeepSeekResponse(rawContent);
+        let fullResponse = "";
+        let isThinking = false;
 
-        console.log("IA Clean:", cleanContent.substring(0, 100)); 
+        for await (const chunk of stream) {
+            const content = chunk.choices[0]?.delta?.content || "";
+            fullResponse += content;
 
+            const status = shouldStream(content, isThinking);
+            isThinking = status.thinking;
+
+            if (status.emit && content) {
+                res.write(`data: ${JSON.stringify({ chunk: content })}\n\n`);
+            }
+        }
+
+        const cleanJson = cleanDeepSeekResponse(fullResponse);
         let aiData;
         try {
-            aiData = JSON.parse(cleanContent);
+            aiData = JSON.parse(cleanJson);
         } catch (e) {
-            console.error("Error parseando JSON IA:", cleanContent);
+            console.error("Error parseando JSON de IA:", cleanJson);
             aiData = { 
-                reply: "Estoy procesando esa información, ¿podrías darme más detalles?", 
+                reply: "Entendido. ¿Podrías darme más detalles sobre eso?", 
                 updated_context: session.extracted_context, 
                 is_ready: false 
             };
         }
 
         const history = Array.isArray(session.conversation_history) ? session.conversation_history : [];
-
         await masterSupabase.from('onboarding_session').update({
-            conversation_history: [...history, { user: message, bot: aiData.reply }],
+            conversation_history: [...history, { user: message, bot: aiData.reply }].slice(-20), // Guardar más historia
             extracted_context: aiData.updated_context,
             analysis_status: aiData.is_ready ? 'ready' : 'listening'
         }).eq('session_id', session.session_id);
 
-        res.json(aiData);
+        res.write(`data: ${JSON.stringify({ final: true, ...aiData })}\n\n`);
+        res.end();
+
     } catch (e) {
-        console.error("Error en Onboarding:", e);
-        res.status(500).json({ error: "Error en el cerebro digital." });
+        console.error("Error en onboarding:", e);
+        res.write(`data: ${JSON.stringify({ error: "Error temporal en el asistente." })}\n\n`);
+        res.end();
     }
 });
 
-// 5. COMPLETAR ONBOARDING (Restaurados campos críticos)
 app.post('/api/onboarding/complete', requireAuth, validate(onboardingCompleteSchema), async (req, res) => {
     const { conversationSummary } = req.body;
     const user = req.user;
 
     try {
-        // Auto-reparación antes de construir
         await masterSupabase.from('users').upsert({ id: user.id, email: user.email, role: 'admin' }, { onConflict: 'id', ignoreDuplicates: true });
         
         await masterSupabase.from('web_clinica').upsert({ 
             "ID_USER": user.id,
             "SUPABASE_URL": "[https://building.vintex.ai](https://building.vintex.ai)",
-            "SUPABASE_ANON_KEY": "building", // Restaurado
-            "SUPABASE_SERVICE_KEY": "building", // Restaurado
-            "JWT_SECRET": "building", // Restaurado
+            "SUPABASE_ANON_KEY": "building",
+            "SUPABASE_SERVICE_KEY": "building",
+            "JWT_SECRET": "building",
             "status": "building" 
         }, { onConflict: "ID_USER" });
 
-        // Trigger Async Construction
-        buildSystemWithAI(user.id, conversationSummary).catch(e => console.error("Async build error:", e));
+        buildSystemWithAI(user.id, conversationSummary).catch(e => console.error("Error async build:", e));
 
-        res.json({ success: true, message: "Construyendo..." });
+        res.json({ success: true, message: "¡Construcción iniciada! Te avisaremos cuando esté listo." });
     } catch (error) {
+        console.error("Error completando onboarding:", error);
         res.status(500).json({ error: "Error iniciando construcción." });
     }
 });
 
-// 6. CHAT GENERAL (Restaurado con DeepSeek R1)
+// CHAT GENERAL CON STREAMING
 app.post('/chat', requireAuth, chatLimiter, validate(chatSchema), async (req, res) => {
     const { message } = req.body; 
     
@@ -419,26 +463,32 @@ app.post('/chat', requireAuth, chatLimiter, validate(chatSchema), async (req, re
         return res.status(400).json({ error: "Entrada no permitida." });
     }
 
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+
     try {
-        const completion = await openai.chat.completions.create({
-            model: AI_MODEL, // DeepSeek R1
+        const stream = await openai.chat.completions.create({
+            model: AI_MODEL,
             messages: [
-                { role: "system", content: "Eres Vintex AI, un asistente experto en gestión." },
+                { role: "system", content: "Eres Vintex AI, un asistente experto, amable y profesional en gestión de clínicas y negocios." },
                 { role: "user", content: message }
             ],
+            stream: true,
             temperature: 0.7,
-            max_tokens: 1000,
         });
 
-        const raw = completion.choices[0]?.message?.content || "";
-        res.json({ response: cleanDeepSeekResponse(raw) });
-
+        for await (const chunk of stream) {
+            const content = chunk.choices[0]?.delta?.content || "";
+            if (content) res.write(`data: ${JSON.stringify({ chunk: content })}\n\n`);
+        }
+        res.end();
     } catch (e) {
-        res.status(503).json({ error: "El servicio de IA está ocupado." });
+        console.error("Error en chat:", e);
+        res.write(`data: ${JSON.stringify({ error: "Servicio temporalmente no disponible." })}\n\n`);
+        res.end();
     }
 });
 
-// 7. INSTANCIADOR DE PLANTILLAS (Restaurado)
 app.post('/api/templates/instantiate', requireAuth, async (req, res) => {
     const { templateId } = req.body;
     const userId = req.user.id;
@@ -452,13 +502,12 @@ app.post('/api/templates/instantiate', requireAuth, async (req, res) => {
             status: 'preview_template' 
         }, { onConflict: 'ID_USER' });
 
-        res.json({ success: true, message: "Plantilla cargada" });
+        res.json({ success: true, message: "Plantilla cargada correctamente" });
     } catch (error) {
         res.status(500).json({ error: "Error al cargar la plantilla" });
     }
 });
 
-// 8. INTERNAL CREDENTIALS (Restaurado)
 app.post('/api/internal/get-clinic-credentials', async (req, res) => {
     const internalSecret = req.headers['x-internal-secret'];
     if (!internalSecret || internalSecret !== process.env.INTERNAL_SECRET_KEY) {
@@ -467,12 +516,13 @@ app.post('/api/internal/get-clinic-credentials', async (req, res) => {
     const { userId } = req.body;
     try {
         const { data: config } = await masterSupabase.from('web_clinica').select('SUPABASE_URL, SUPABASE_SERVICE_KEY').eq('ID_USER', userId).single();
-        if (!config) return res.status(404).json({ error: 'No config' });
+        if (!config) return res.status(404).json({ error: 'Configuración no encontrada' });
         res.json({ url: config.SUPABASE_URL, key: config.SUPABASE_SERVICE_KEY });
-    } catch (e) { res.status(500).json({ error: 'Internal Error' }); }
+    } catch (e) { 
+        res.status(500).json({ error: 'Error interno' }); 
+    }
 });
 
-// 9. INIT SESSION (Con Auto-Reparación Restaurada)
 app.get('/api/config/init-session', async (req, res) => {
     const authHeader = req.headers.authorization;
     if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
@@ -481,7 +531,7 @@ app.get('/api/config/init-session', async (req, res) => {
         const { data: { user } } = await masterSupabase.auth.getUser(authHeader.split(' ')[1]);
         if (!user) return res.status(401).json({ error: 'Sesión inválida' });
 
-        // AUTO-REPAIR (Restaurado para robustez)
+        // Auto-reparación robusta
         await masterSupabase.from('users').upsert({
             id: user.id, email: user.email, full_name: user.email.split('@')[0], role: 'admin'
         }, { onConflict: 'id', ignoreDuplicates: true });
@@ -513,6 +563,7 @@ app.get('/api/config/init-session', async (req, res) => {
 });
 
 const server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 VINTEX ENGINE con DEEPSEEK R1 en puerto ${PORT}`);
+    console.log(`🚀 VINTEX ENGINE MEJORADO - Streaming + Excel Inteligente + Seguridad RLS en puerto ${PORT}`);
 });
-server.setTimeout(60000);
+
+server.setTimeout(600000); // 10 minutos
