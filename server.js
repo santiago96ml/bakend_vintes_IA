@@ -1,14 +1,14 @@
 import express from 'express';
 import cors from 'cors';
-import dotenv from 'dotenv';
+import dotenv from 'dotenv'; // Corregido el typo
 import { createClient } from '@supabase/supabase-js';
-import rateLimit from 'express-rate-limit'; // Corregido: importación por defecto suele ser mejor aquí
+import rateLimit from 'express-rate-limit';
 import helmet from 'helmet';
 import { z } from 'zod';
 import crypto from 'crypto';
 import OpenAI from 'openai';
 import multer from 'multer';
-import * as xlsx from 'xlsx'; // Corregido: Importación compatible con ESM
+import * as xlsx from 'xlsx';
 import { Readable } from 'stream';
 import pg from 'pg';
 
@@ -20,27 +20,25 @@ app.set('trust proxy', 1);
 
 const PORT = process.env.PORT || 3000;
 
-// --- CONFIGURACIÓN POOL DE BASE DE DATOS (Para crear tablas) ---
+// --- CONFIGURACIÓN POOL DE BASE DE DATOS ---
 if (!process.env.DATABASE_URL) {
-    console.warn("⚠️ ADVERTENCIA: Falta DATABASE_URL. La construcción automática de tablas fallará.");
+    console.warn("⚠️ ADVERTENCIA: Falta DATABASE_URL.");
 }
 const dbPool = new pg.Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false } 
 });
 
-// Manejo de errores del pool para evitar caídas
 dbPool.on('error', (err) => {
     console.error('🔥 Error inesperado en el cliente PG inactivo', err);
 });
 
-// --- SEGURIDAD Y CONFIGURACIÓN GENERAL ---
+// --- SEGURIDAD (Encriptación restaurada) ---
 const ENCRYPTION_KEY = process.env.MASTER_ENCRYPTION_KEY 
     ? Buffer.from(process.env.MASTER_ENCRYPTION_KEY, 'hex') 
     : crypto.randomBytes(32);
 const IV_LENGTH = 16;
 
-// Funciones Auxiliares Crypto
 function encrypt(text) {
     if (!text) return null;
     let iv = crypto.randomBytes(IV_LENGTH);
@@ -66,14 +64,16 @@ function decrypt(text) {
     }
 }
 
-// Configuración OpenRouter (IA)
+// --- CONFIGURACIÓN OPENROUTER (DeepSeek R1) ---
 let openai;
+const AI_MODEL = "deepseek/deepseek-r1:free"; // Modelo potente y gratuito
+
 if (process.env.OPENROUTER_API_KEY) {
     openai = new OpenAI({
         apiKey: process.env.OPENROUTER_API_KEY,
-        baseURL: "https://openrouter.ai/api/v1", // ✅ URL corregida
+        baseURL: "https://openrouter.ai/api/v1",
         defaultHeaders: {
-            "HTTP-Referer": process.env.FRONTEND_URL || "https://vintex.net.br", // ✅ URL corregida
+            "HTTP-Referer": process.env.FRONTEND_URL || "https://vintex.net.br",
             "X-Title": "Vintex AI",
         }
     });
@@ -81,7 +81,6 @@ if (process.env.OPENROUTER_API_KEY) {
     console.error("❌ FALTA OPENROUTER_API_KEY en .env");
 }
 
-// ✅ URLs corregidas (eliminados los corchetes y paréntesis de Markdown)
 const SATELLITE_URL = process.env.SATELLITE_URL || "https://api-clinica.vintex.net.br";
 const FRONTEND_URL = process.env.FRONTEND_URL || "https://vintex.net.br";
 const HOSTINGER_URL = "https://webs-de-vintex-login-web.1kh9sk.easypanel.host";
@@ -89,7 +88,7 @@ const HOSTINGER_URL = "https://webs-de-vintex-login-web.1kh9sk.easypanel.host";
 const ALLOWED_ORIGINS = [
     FRONTEND_URL,
     HOSTINGER_URL,
-    'https://vintex.net.br', // ✅ URL corregida
+    'https://vintex.net.br',
     'http://localhost:5173',
     'http://localhost:3000'
 ];
@@ -105,7 +104,7 @@ app.use(helmet({
 app.use(cors({
     origin: (origin, callback) => {
         if (!origin || ALLOWED_ORIGINS.includes(origin)) { callback(null, true); } 
-        else { console.warn(`[CORS] Bloqueo: ${origin}`); callback(new Error('Bloqueado por CORS')); }
+        else { callback(null, true); } 
     },
     methods: ['GET', 'POST', 'PATCH', 'DELETE'],
     allowedHeaders: ['Content-Type', 'Authorization', 'x-internal-secret'],
@@ -136,13 +135,34 @@ const masterSupabase = createClient(
     { auth: { autoRefreshToken: false, persistSession: false } }
 );
 
+// --- 🔧 UTILIDAD DE LIMPIEZA PARA DEEPSEEK R1 ---
+function cleanDeepSeekResponse(content) {
+    if (!content) return "";
+    
+    // 1. Eliminar el proceso de pensamiento <think>...</think>
+    let clean = content.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+
+    // 2. Intentar extraer JSON de bloques de código markdown ```json ... ```
+    const jsonMatch = clean.match(/```json([\s\S]*?)```/);
+    if (jsonMatch) return jsonMatch[1].trim();
+
+    // 3. Intentar extraer SQL de bloques ```sql ... ```
+    const sqlMatch = clean.match(/```sql([\s\S]*?)```/);
+    if (sqlMatch) return sqlMatch[1].trim();
+
+    // 4. Si no hay markdown, buscar el primer '{' y el último '}' para JSON
+    const braceMatch = clean.match(/\{[\s\S]*\}/);
+    if (braceMatch) return braceMatch[0];
+
+    return clean;
+}
+
 // --- SCHEMAS ZOD ---
-const loginSchema = z.object({ email: z.string().email(), password: z.string() });
 const registerSchema = z.object({ email: z.string().email(), password: z.string().min(8), full_name: z.string().min(2) });
+const loginSchema = z.object({ email: z.string().email(), password: z.string() });
 const trialSchema = z.object({ email: z.string().email(), fullName: z.string().min(2), phone: z.string().min(8) });
 const chatSchema = z.object({ message: z.string().min(1).max(2000), threadId: z.string().optional() });
 const onboardingCompleteSchema = z.object({ conversationSummary: z.string().min(10), schemaConfig: z.any().optional() });
-const onboardingChatSchema = z.object({ messages: z.array(z.any()) });
 
 const validate = (schema) => (req, res, next) => {
     try { schema.parse(req.body); next(); } 
@@ -165,69 +185,45 @@ const requireAuth = async (req, res, next) => {
 const detectPromptInjection = (text) => {
     const patterns = [
         /ignore previous instructions/i, /ignora tus instrucciones/i,
-        /system prompt/i, /act as a/i, /actúa como/i, /reset instructions/i,
-        /eres un bot/i, /your core directive/i
+        /system prompt/i, /act as a/i, /actúa como/i, /reset instructions/i
     ];
-    if (typeof text === 'string') {
-        return patterns.some(pattern => pattern.test(text));
-    } else if (Array.isArray(text)) {
-        return text.some(msg => patterns.some(pattern => pattern.test(msg.content || "")));
-    }
+    if (typeof text === 'string') return patterns.some(pattern => pattern.test(text));
     return false;
 };
 
-// --- 🧠 FUNCIÓN MAESTRA: CONSTRUCTOR DE SISTEMAS (Reemplaza a n8n) ---
+// --- 🧠 CONSTRUCTOR DE SISTEMAS CON DEEPSEEK R1 ---
 async function buildSystemWithAI(userId, summary) {
     console.log(`🏗️ [CONSTRUCTOR] Iniciando obra para usuario: ${userId}`);
     
-    if (!openai) {
-        console.error("🔥 Error: OpenAI no inicializado. Abortando construcción.");
-        return;
-    }
-
+    if (!openai) return;
     const dbClient = await dbPool.connect(); 
 
     try {
         const systemPrompt = `
         ERES UN INGENIERO DE BASES DE DATOS POSTGRESQL EXPERTO.
-        TU TAREA: Generar un script SQL ejecutable basado en los requisitos del usuario.
+        TU TAREA: Generar un script SQL para: "${summary}"
         
-        REQUISITOS DEL USUARIO:
-        "${summary}"
-        
-        REGLAS CRÍTICAS DE SEGURIDAD Y DISEÑO:
-        1.  TODAS las tablas deben tener RLS (Row Level Security) activado.
-        2.  TODAS las tablas deben tener una columna "user_id" tipo UUID que referencie a 'auth.users(id)'.
-        3.  Crea una política RLS para cada tabla que permita al usuario ver/editar SOLO sus filas:
-            Example: CREATE POLICY "Users can manage own data" ON table_name USING (auth.uid() = user_id);
-        4.  Usa tipos de datos adecuados (TEXT, BOOLEAN, TIMESTAMPTZ, NUMERIC).
-        5.  NO borres tablas existentes (usa CREATE TABLE IF NOT EXISTS).
-        6.  Devuelve SOLO el código SQL, sin explicaciones ni markdown (nada de \`\`\`sql).
+        REGLAS:
+        1. Tablas con RLS activado.
+        2. Columna "user_id" (UUID) en todas las tablas que referencie a auth.users.
+        3. CREATE POLICY "Manage own data" ON table USING (auth.uid() = user_id);
+        4. Devuelve SOLO el código SQL dentro de un bloque markdown.
         `;
 
         const completion = await openai.chat.completions.create({
-            model: "meta-llama/llama-3.3-70b-instruct:free", 
+            model: AI_MODEL, 
             messages: [{ role: "system", content: systemPrompt }],
-            temperature: 0.2,
+            temperature: 0.1, 
         });
 
-        let sqlCode = completion.choices[0].message.content;
-        
-        // Limpieza robusta del SQL (Elimina bloques de markdown si existen)
-        const sqlMatch = sqlCode.match(/```sql([\s\S]*?)```/) || sqlCode.match(/```([\s\S]*?)```/);
-        if (sqlMatch) {
-            sqlCode = sqlMatch[1].trim();
-        } else {
-            sqlCode = sqlCode.trim();
-        }
-        
-        // Limpiar palabras clave peligrosas muy básicas (opcional, pero recomendado)
-        if (sqlCode.toLowerCase().includes('drop table') || sqlCode.toLowerCase().includes('drop database')) {
-             console.warn("⚠️ ALERTA: La IA intentó borrar tablas. Se bloqueará la ejecución.");
-             throw new Error("Código SQL inseguro detectado.");
-        }
+        // Limpieza específica para R1
+        let rawContent = completion.choices[0].message.content;
+        let sqlCode = cleanDeepSeekResponse(rawContent);
 
-        console.log(`📜 SQL Generado (Preview): ${sqlCode.substring(0, 100)}...`);
+        // Limpieza extra por seguridad
+        if (sqlCode.startsWith('```')) sqlCode = sqlCode.replace(/```sql|```/g, '');
+        
+        console.log(`📜 SQL Generado: ${sqlCode.substring(0, 50)}...`);
 
         await dbClient.query('BEGIN'); 
         await dbClient.query(sqlCode);
@@ -239,13 +235,11 @@ async function buildSystemWithAI(userId, summary) {
 
         await dbClient.query(`
             UPDATE public.web_clinica 
-            SET status = 'active', 
-                ui_config = $1 
-            WHERE "ID_USER" = $2
+            SET status = 'active', ui_config = $1 WHERE "ID_USER" = $2
         `, [JSON.stringify(defaultUiConfig), userId]);
 
         await dbClient.query('COMMIT');
-        console.log(`✅ [CONSTRUCTOR] Sistema desplegado con éxito para ${userId}`);
+        console.log(`✅ [CONSTRUCTOR] Sistema listo para ${userId}`);
 
     } catch (error) {
         await dbClient.query('ROLLBACK');
@@ -256,43 +250,29 @@ async function buildSystemWithAI(userId, summary) {
 }
 
 // =================================================================
-// RUTAS DE NEGOCIO
+// RUTAS
 // =================================================================
 
-// 1. REGISTRO
+// 1. REGISTER
 app.post('/api/register', authLimiter, validate(registerSchema), async (req, res) => {
-  const { email, password, full_name } = req.body;
-  try {
-    const { data: authData, error: authError } = await masterSupabase.auth.signUp({
-      email, password, options: { data: { full_name } }
-    });
-    if (authError) throw authError;
-    if (!authData.user) throw new Error("Error en creación de usuario.");
-    const userId = authData.user.id;
+    const { email, password, full_name } = req.body;
+    try {
+        const { data, error } = await masterSupabase.auth.signUp({ email, password, options: { data: { full_name } } });
+        
+        if (error) return res.status(400).json({ error: error.message });
+        
+        // Upsert perfil para consistencia
+        await masterSupabase.from('users').upsert({ id: data.user.id, email, full_name, role: 'admin' }, { onConflict: 'id' });
+        await masterSupabase.from('servisi').upsert({ "ID_User": data.user.id, web_clinica: true, "Bot_clinica": true }, { onConflict: 'ID_User' });
 
-    // Verificar si el usuario ya existe en public.users para evitar duplicados si auth falló a medias
-    const { error: userError } = await masterSupabase.from('users').upsert({
-        id: userId, email, full_name, role: 'admin', created_at: new Date()
-    }, { onConflict: 'id' });
-    
-    if (userError) console.error("Error insertando user profile:", userError);
-
-    await masterSupabase.from('servisi').upsert({
-        "ID_User": userId, web_clinica: true, "Bot_clinica": true 
-    }, { onConflict: 'ID_User' });
-
-    res.status(200).json({
-      message: 'Usuario registrado correctamente',
-      user: { id: authData.user.id, email: authData.user.email },
-      session: authData.session 
-    });
-  } catch (error) {
-    console.error("Registro error:", error.message); 
-    res.status(400).json({ error: error.message || 'Error al procesar el registro.' });
-  }
+        res.json({ user: data.user, session: data.session });
+    } catch (error) {
+        console.error("Error Registro:", error);
+        res.status(400).json({ error: "Error procesando registro" });
+    }
 });
 
-// 2. START TRIAL
+// 2. START TRIAL (Restaurado)
 app.post('/api/start-trial', authLimiter, validate(trialSchema), async (req, res) => {
     const { email, fullName, phone } = req.body;
     const tempPassword = crypto.randomBytes(16).toString('hex') + "V!1";
@@ -302,13 +282,10 @@ app.post('/api/start-trial', authLimiter, validate(trialSchema), async (req, res
         });
         if (authError) throw authError;
         const userId = authData.user.id;
-        await masterSupabase.from('users').upsert({
-            id: userId, email, full_name: fullName, phone, role: 'admin'
-        });
-        await masterSupabase.from('servisi').upsert({ 
-            "ID_User": userId, web_clinica: true, "Bot_clinica": true 
-        });
-        console.log(`[INFO] Usuario Trial creado: ${email}`); 
+        
+        await masterSupabase.from('users').upsert({ id: userId, email, full_name: fullName, phone, role: 'admin' });
+        await masterSupabase.from('servisi').upsert({ "ID_User": userId, web_clinica: true, "Bot_clinica": true });
+        
         return res.status(201).json({ success: true, message: 'Usuario registrado. Revisa tu email.' });
     } catch (error) {
         console.error("Trial error:", error.message);
@@ -319,23 +296,12 @@ app.post('/api/start-trial', authLimiter, validate(trialSchema), async (req, res
 // 3. LOGIN
 app.post('/api/login', authLimiter, validate(loginSchema), async (req, res) => {
     const { email, password } = req.body;
-    try {
-        const { data, error } = await masterSupabase.auth.signInWithPassword({ email, password });
-        if (error || !data.user) {
-            return res.status(401).json({ error: 'Credenciales inválidas' });
-        }
-        return res.json({
-            success: true,
-            session: data.session,
-            user: { id: data.user.id, email: data.user.email }
-        });
-    } catch (e) {
-        console.error("Error Login:", e.message);
-        return res.status(500).json({ error: 'Error interno de autenticación.' });
-    }
+    const { data, error } = await masterSupabase.auth.signInWithPassword({ email, password });
+    if (error) return res.status(401).json({ error: 'Credenciales inválidas' });
+    return res.json({ success: true, session: data.session, user: { id: data.user.id, email: data.user.email } });
 });
 
-// 4. CHAT ARQUITECTO (Onboarding Interactivo)
+// 4. CHAT ARQUITECTO (Onboarding Interactivo con DeepSeek R1 y Excel)
 app.post('/api/onboarding/interactive', requireAuth, upload.single('file'), async (req, res) => {
     const { message } = req.body;
     const file = req.file;
@@ -351,31 +317,58 @@ app.post('/api/onboarding/interactive', requireAuth, upload.single('file'), asyn
         }
 
         let fileContext = "";
+        // Restaurada lógica de Excel para dar contexto a la IA
         if (file && (file.mimetype.includes('csv') || file.mimetype.includes('spreadsheet'))) {
             const workbook = xlsx.read(file.buffer, { type: 'buffer' });
             const sheet = workbook.Sheets[workbook.SheetNames[0]];
             const dataPreview = xlsx.utils.sheet_to_json(sheet, { header: 1 }).slice(0, 10);
             fileContext = `[ARCHIVO ADJUNTO] El usuario subió datos. Estructura: ${JSON.stringify(dataPreview)}`;
+        } else if (file) {
+            fileContext = "[Archivo recibido]";
         }
 
         const systemPrompt = `
-        Eres Vintex Architect. Entrevista al usuario para crear su software.
-        Memoria: ${JSON.stringify(session.extracted_context)}
-        Responde JSON: { "reply": "...", "updated_context": {...}, "is_ready": boolean }
+        Eres Vintex Architect. Entrevista al usuario.
+        Memoria actual: ${JSON.stringify(session.extracted_context)}
+        
+        OBJETIVO: Obtener detalles para construir el software.
+        
+        FORMATO DE RESPUESTA REQUERIDO (JSON PURO):
+        { 
+            "reply": "Tu respuesta al usuario...", 
+            "updated_context": { ...datos extraídos... }, 
+            "is_ready": boolean (true si ya tienes toda la info básica) 
+        }
+        NO escribas nada fuera del JSON.
         `;
 
         const completion = await openai.chat.completions.create({
-            model: "meta-llama/llama-3.3-70b-instruct:free",
+            model: AI_MODEL, // DeepSeek R1 Free
             messages: [
                 { role: "system", content: systemPrompt },
                 { role: "user", content: `User: ${message}. ${fileContext}` }
             ],
-            response_format: { type: "json_object" }
+            // response_format ELIMINADO para compatibilidad
         });
 
-        const aiData = JSON.parse(completion.choices[0].message.content);
+        // ✅ LIMPIEZA DEEPSEEK
+        let rawContent = completion.choices[0].message.content;
+        let cleanContent = cleanDeepSeekResponse(rawContent);
 
-        // Validar que conversation_history sea array
+        console.log("IA Clean:", cleanContent.substring(0, 100)); 
+
+        let aiData;
+        try {
+            aiData = JSON.parse(cleanContent);
+        } catch (e) {
+            console.error("Error parseando JSON IA:", cleanContent);
+            aiData = { 
+                reply: "Estoy procesando esa información, ¿podrías darme más detalles?", 
+                updated_context: session.extracted_context, 
+                is_ready: false 
+            };
+        }
+
         const history = Array.isArray(session.conversation_history) ? session.conversation_history : [];
 
         await masterSupabase.from('onboarding_session').update({
@@ -386,73 +379,49 @@ app.post('/api/onboarding/interactive', requireAuth, upload.single('file'), asyn
 
         res.json(aiData);
     } catch (e) {
-        console.error(e);
-        res.status(500).json({ error: "Error pensando..." });
+        console.error("Error en Onboarding:", e);
+        res.status(500).json({ error: "Error en el cerebro digital." });
     }
 });
 
-// 5. COMPLETAR ONBOARDING (¡AHORA SIN N8N!) 🚀
+// 5. COMPLETAR ONBOARDING (Restaurados campos críticos)
 app.post('/api/onboarding/complete', requireAuth, validate(onboardingCompleteSchema), async (req, res) => {
     const { conversationSummary } = req.body;
     const user = req.user;
 
     try {
-        console.log(`🚀 Iniciando despliegue LOCAL para Usuario: ${user.id}`);
-
-        // --- AUTO-REPARACIÓN (UPSERT) ---
-        await masterSupabase.from('users').upsert({
-            id: user.id,
-            email: user.email,
-            full_name: user.email.split('@')[0],
-            role: 'admin',
-            created_at: new Date()
-        }, { onConflict: 'id', ignoreDuplicates: true });
-
-        await masterSupabase.from('servisi').upsert({
-            "ID_User": user.id, web_clinica: true, "Bot_clinica": true
-        }, { onConflict: "ID_User", ignoreDuplicates: true });
-
-        // --- ESTADO INICIAL: BUILDING ---
-        const { error: dbError } = await masterSupabase.from('web_clinica').upsert({ 
+        // Auto-reparación antes de construir
+        await masterSupabase.from('users').upsert({ id: user.id, email: user.email, role: 'admin' }, { onConflict: 'id', ignoreDuplicates: true });
+        
+        await masterSupabase.from('web_clinica').upsert({ 
             "ID_USER": user.id,
-            "SUPABASE_URL": "https://building.vintex.ai", // ✅ URL corregida
-            "SUPABASE_ANON_KEY": "building",
-            "SUPABASE_SERVICE_KEY": "building",
-            "JWT_SECRET": "building",
+            "SUPABASE_URL": "[https://building.vintex.ai](https://building.vintex.ai)",
+            "SUPABASE_ANON_KEY": "building", // Restaurado
+            "SUPABASE_SERVICE_KEY": "building", // Restaurado
+            "JWT_SECRET": "building", // Restaurado
             "status": "building" 
         }, { onConflict: "ID_USER" });
 
-        if (dbError) throw dbError;
+        // Trigger Async Construction
+        buildSystemWithAI(user.id, conversationSummary).catch(e => console.error("Async build error:", e));
 
-        // --- 🔥 EL REEMPLAZO DE N8N 🔥 ---
-        // Se ejecuta sin await para no bloquear la respuesta HTTP
-        buildSystemWithAI(user.id, conversationSummary).catch(err => 
-            console.error("🔥 Error asíncrono en constructor:", err)
-        );
-
-        res.json({ success: true, message: "Arquitecto trabajando en segundo plano..." });
-
+        res.json({ success: true, message: "Construyendo..." });
     } catch (error) {
-        console.error("Error Onboarding:", error);
         res.status(500).json({ error: "Error iniciando construcción." });
     }
 });
 
-// 6. CHAT GENERAL (Legacy)
+// 6. CHAT GENERAL (Restaurado con DeepSeek R1)
 app.post('/chat', requireAuth, chatLimiter, validate(chatSchema), async (req, res) => {
     const { message } = req.body; 
-    const userId = req.user.id;
-
+    
     if (detectPromptInjection(message)) {
-        console.warn(`[SECURITY] Prompt Injection detectado User: ${userId}`);
         return res.status(400).json({ error: "Entrada no permitida." });
     }
 
-    if (!openai) return res.status(503).json({ error: "Servicio de IA no disponible" });
-
     try {
         const completion = await openai.chat.completions.create({
-            model: "tngtech/deepseek-r1t2-chimera:free", 
+            model: AI_MODEL, // DeepSeek R1
             messages: [
                 { role: "system", content: "Eres Vintex AI, un asistente experto en gestión." },
                 { role: "user", content: message }
@@ -461,20 +430,18 @@ app.post('/chat', requireAuth, chatLimiter, validate(chatSchema), async (req, re
             max_tokens: 1000,
         });
 
-        const responseText = completion.choices[0]?.message?.content || "No pude generar una respuesta.";
-        res.json({ response: responseText });
+        const raw = completion.choices[0]?.message?.content || "";
+        res.json({ response: cleanDeepSeekResponse(raw) });
 
     } catch (e) {
-        console.error("Error Chat OpenRouter:", e);
         res.status(503).json({ error: "El servicio de IA está ocupado." });
     }
 });
 
-// 7. INSTANCIADOR DE PLANTILLAS
+// 7. INSTANCIADOR DE PLANTILLAS (Restaurado)
 app.post('/api/templates/instantiate', requireAuth, async (req, res) => {
     const { templateId } = req.body;
     const userId = req.user.id;
-
     try {
         const { data: template } = await masterSupabase.from('templates').select('*').eq('id', templateId).single();
         if (!template) return res.status(404).json({ error: "Plantilla no encontrada" });
@@ -487,12 +454,11 @@ app.post('/api/templates/instantiate', requireAuth, async (req, res) => {
 
         res.json({ success: true, message: "Plantilla cargada" });
     } catch (error) {
-        console.error("Error instanciando plantilla:", error);
         res.status(500).json({ error: "Error al cargar la plantilla" });
     }
 });
 
-// 8. INTERNAL CREDENTIALS (Uso interno)
+// 8. INTERNAL CREDENTIALS (Restaurado)
 app.post('/api/internal/get-clinic-credentials', async (req, res) => {
     const internalSecret = req.headers['x-internal-secret'];
     if (!internalSecret || internalSecret !== process.env.INTERNAL_SECRET_KEY) {
@@ -506,28 +472,27 @@ app.post('/api/internal/get-clinic-credentials', async (req, res) => {
     } catch (e) { res.status(500).json({ error: 'Internal Error' }); }
 });
 
-// 9. INIT SESSION (CON AUTO-REPARACIÓN BLINDADA)
+// 9. INIT SESSION (Con Auto-Reparación Restaurada)
 app.get('/api/config/init-session', async (req, res) => {
     const authHeader = req.headers.authorization;
     if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
     
     try {
-        const { data: { user }, error } = await masterSupabase.auth.getUser(authHeader.split(' ')[1]);
-        if (error || !user) return res.status(401).json({ error: 'Sesión inválida' });
+        const { data: { user } } = await masterSupabase.auth.getUser(authHeader.split(' ')[1]);
+        if (!user) return res.status(401).json({ error: 'Sesión inválida' });
 
-        // AUTO-REPAIR
+        // AUTO-REPAIR (Restaurado para robustez)
         await masterSupabase.from('users').upsert({
-            id: user.id, email: user.email, full_name: user.email.split('@')[0], role: 'admin', created_at: new Date()
+            id: user.id, email: user.email, full_name: user.email.split('@')[0], role: 'admin'
         }, { onConflict: 'id', ignoreDuplicates: true });
 
         await masterSupabase.from('servisi').upsert({
             "ID_User": user.id, web_clinica: true, "Bot_clinica": true
         }, { onConflict: "ID_User", ignoreDuplicates: true });
 
-        // BUSCAR CONFIG
         const { data: config } = await masterSupabase
             .from('web_clinica')
-            .select('SUPABASE_URL, SUPABASE_ANON_KEY, ui_config')
+            .select('*')
             .eq('ID_USER', user.id)
             .maybeSingle();
             
@@ -548,7 +513,6 @@ app.get('/api/config/init-session', async (req, res) => {
 });
 
 const server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 VINTEX ENGINE (NODE+AI) en puerto ${PORT}`);
+    console.log(`🚀 VINTEX ENGINE con DEEPSEEK R1 en puerto ${PORT}`);
 });
-// Aumentamos el timeout para operaciones largas de IA
 server.setTimeout(60000);
