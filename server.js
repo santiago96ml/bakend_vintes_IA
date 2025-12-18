@@ -61,9 +61,9 @@ function decrypt(text) {
 
 // --- CONFIGURACIÓN OPENROUTER (ARQUITECTURA DE NODOS 2025) ---
 let openai;
-const MODEL_ORQUESTADOR = "meta-llama/llama-3.1-405b-instruct:free"; 
-const MODEL_ANALISTA = "meta-llama/llama-3.2-3b-instruct:free";
-const MODEL_VISION = "qwen/qwen-2.5-vl-7b-instruct:free";
+const MODEL_ORQUESTADOR = "deepseek/deepseek-r1:free"; 
+const MODEL_ANALISTA = "google/gemini-2.0-flash-exp:free";
+const MODEL_VISION = "qwen/qwen-2.5-vl-72b-instruct:free";
 
 if (process.env.OPENROUTER_API_KEY) {
     openai = new OpenAI({
@@ -134,26 +134,49 @@ function detectPromptInjection(text) {
 
 // --- 🤖 AGENTES ESPECIALIZADOS (NODOS) ---
 
+// MEJORA APLICADA: Soporte para múltiples hojas y múltiples archivos
 async function nodoAnalistaExcel(files) {
     if (!files || files.length === 0) return "Sin archivos de datos.";
     try {
-        const summaries = files.map(file => {
+        const allSheetsSummary = [];
+        
+        for (const file of files) {
             const workbook = xlsx.read(file.buffer, { type: 'buffer' });
-            const sheet = workbook.Sheets[workbook.SheetNames[0]];
-            const rawData = xlsx.utils.sheet_to_json(sheet, { header: 1 });
-            return {
-                name: file.originalname,
-                structure: rawData.slice(0, 15),
-                rows: rawData.length
-            };
-        });
+            
+            // Iteramos por todas las hojas que contenga el archivo
+            const fileSheets = workbook.SheetNames.map(sheetName => {
+                const sheet = workbook.Sheets[sheetName];
+                const rawData = xlsx.utils.sheet_to_json(sheet, { header: 1 });
+                
+                return {
+                    fileName: file.originalname,
+                    sheetName: sheetName,
+                    structure: rawData.slice(0, 15), // Primeras 15 filas como contexto
+                    rows: rawData.length
+                };
+            });
+            
+            allSheetsSummary.push(...fileSheets);
+        }
+
         const completion = await openai.chat.completions.create({
             model: MODEL_ANALISTA,
-            messages: [{ role: "system", content: "Analista de datos. Describe el esquema y tendencias." },
-                       { role: "user", content: JSON.stringify(summaries) }]
+            messages: [
+                { 
+                    role: "system", 
+                    content: "Eres un Analista de Datos experto. Tu tarea es describir el esquema de base de datos necesario, las relaciones entre las diferentes hojas y detectar tendencias clave." 
+                },
+                { 
+                    role: "user", 
+                    content: `Analiza estos datos (múltiples hojas detectadas): ${JSON.stringify(allSheetsSummary)}` 
+                }
+            ]
         });
         return completion.choices[0].message.content;
-    } catch (e) { return "Error analizando datos."; }
+    } catch (e) { 
+        logger.error("Error analizando Excel:", e);
+        return "Error al procesar la estructura de los archivos."; 
+    }
 }
 
 async function nodoVision(files) {
@@ -192,7 +215,7 @@ async function buildSystemWithAI(userId, summary) {
         await client.query('COMMIT');
         logger.info("Construcción exitosa.");
     } catch (e) {
-        await client.query('ROLLBACK');
+        if (client) await client.query('ROLLBACK');
         logger.error("Error en build:", e.message);
     } finally { client.release(); }
 }
@@ -232,9 +255,13 @@ app.post('/api/onboarding/interactive', requireAuth, upload.array('files', 5), a
 
         res.write(`data: ${JSON.stringify({ status: "analyzing", chunk: "🔍 Vintex Nodes: Procesando archivos...\n" })}\n\n`);
 
+        // Clasificación y ejecución de nodos en paralelo
+        const excelFiles = files.filter(f => f.originalname.match(/\.(xlsx|csv|xls)$/i));
+        const imageFiles = files.filter(f => f.mimetype.includes('image'));
+
         const [reporteExcel, reporteVision] = await Promise.all([
-            nodoAnalistaExcel(files.filter(f => f.originalname.match(/\.(xlsx|csv)$/i))),
-            nodoVision(files.filter(f => f.mimetype.includes('image')))
+            nodoAnalistaExcel(excelFiles),
+            nodoVision(imageFiles)
         ]);
 
         res.write(`data: ${JSON.stringify({ status: "thinking", chunk: "🧠 Orquestador: Generando respuesta...\n" })}\n\n`);
@@ -270,6 +297,7 @@ app.post('/api/onboarding/interactive', requireAuth, upload.array('files', 5), a
         res.write(`data: ${JSON.stringify({ final: true, ...data })}\n\n`);
         res.end();
     } catch (e) {
+        logger.error("Error interactivo:", e);
         res.write(`data: ${JSON.stringify({ error: "Error en el cerebro digital" })}\n\n`);
         res.end();
     }
@@ -322,7 +350,6 @@ app.post('/chat', requireAuth, async (req, res) => {
     } catch (e) { res.end(); }
 });
 
-// OTROS ENDPOINTS
 app.post('/api/onboarding/complete', requireAuth, async (req, res) => {
     const { conversationSummary } = req.body;
     await masterSupabase.from('web_clinica').upsert({ ID_USER: req.user.id, status: "building" });
@@ -340,9 +367,11 @@ app.post('/api/templates/instantiate', requireAuth, async (req, res) => {
 app.get('/api/config/init-session', async (req, res) => {
     const auth = req.headers.authorization;
     if (!auth) return res.status(401).end();
-    const { data: { user } } = await masterSupabase.auth.getUser(auth.split(' ')[1]);
-    const { data: c } = await masterSupabase.from('web_clinica').select('*').eq('ID_USER', user.id).maybeSingle();
-    res.json({ hasClinic: !!c, uiConfig: c?.ui_config });
+    try {
+        const { data: { user } } = await masterSupabase.auth.getUser(auth.split(' ')[1]);
+        const { data: c } = await masterSupabase.from('web_clinica').select('*').eq('ID_USER', user.id).maybeSingle();
+        res.json({ hasClinic: !!c, uiConfig: c?.ui_config });
+    } catch (e) { res.status(500).end(); }
 });
 
 app.use((err, req, res, next) => {
@@ -351,4 +380,4 @@ app.use((err, req, res, next) => {
 });
 
 const server = app.listen(PORT, '0.0.0.0', () => logger.info(`VINTEX ENGINE PRO ON: ${PORT}`));
-server.setTimeout(600000); // 10 Minutos
+server.setTimeout(600000);
